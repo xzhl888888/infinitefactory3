@@ -1,0 +1,53 @@
+{
+  "appId": "com.geometryworkshop.wxgc3",
+  "productName": "无限工厂3",
+  "asar": true,
+  "electronDist": "node_modules/electron/dist",
+  "npmRebuild": false,
+  "forceCodeSigning": false,
+  "directories": {
+    "output": "dist/windows",
+    "buildResources": "assets/app"
+  },
+  "files": [
+    ".build/web/**/*",
+    "platforms/windows/main.mjs",
+    "platforms/windows/preload.cjs",
+    "platforms/windows/service.mjs",
+    "platforms/windows/library.mjs",
+    "src/core/model.js",
+    "src/core/mods.js",
+    "src/ai/protocol.js",
+    "src/ai/prompt.js",
+    "src/content/catalog.js",
+    "assets/app/icon.ico",
+    "package.json"
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "icon": "assets/app/icon.ico",
+    "artifactName": "无限工厂3-${version}-Windows安装.${ext}",
+    "executableName": "无限工厂3"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": "always",
+    "shortcutName": "无限工厂3",
+    "deleteAppDataOnUninstall": false,
+    "runAfterFinish": false,
+    "installerLanguages": [
+      "zh_CN",
+      "en_US"
+    ],
+    "language": "2052"
+  }
+}
