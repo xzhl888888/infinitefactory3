@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import javax.net.ssl.*;
 import java.util.concurrent.*;
+import java.util.*;
 
 /** 仅把本机假服务测试证书放入本次JVM的信任库；APK生产代码从不改变系统TLS验证。 */
 public final class NetworkTests {
@@ -22,7 +23,40 @@ public final class NetworkTests {
         for(String[] test:errors)ContractTests.error(test[1],()->client.generate(SaveCodec.record("baseUrl",base+"/"+test[0],"model","fixture-model"),"fixture-not-real",materials,new AiClient.Request()));
         ContractTests.error("REQUEST_FAILED",()->client.generate(SaveCodec.record("baseUrl","https://localhost:"+port+"/host-mismatch","model","fixture-model"),"fixture-not-real",materials,new AiClient.Request()));
         AiClient.Request pending=new AiClient.Request();ScheduledExecutorService cancel=Executors.newSingleThreadScheduledExecutor();cancel.schedule(()->pending.cancel(),250,TimeUnit.MILLISECONDS);ContractTests.error("CANCELLED",()->client.generate(SaveCodec.record("baseUrl",base+"/delay","model","fixture-model"),"fixture-not-real",materials,pending));cancel.shutdownNow();
-        client.close();JSONArray hits=SaveCodec.parseArray(new String(Files.readAllBytes(directory.resolve("network-hits.json")),StandardCharsets.UTF_8));ContractTests.check(hits.length()==7);
+        // 假服务收到四份请求后才一起放行，可以发现客户端误串行而不依赖耗时阈值。
+        ExecutorService workers = Executors.newFixedThreadPool(4);
+        try {
+            List<Future<JSONObject>> parallel = new ArrayList<>();
+            for (int i = 0; i < 4; i++) {
+                final int index = i;
+                parallel.add(workers.submit(() -> client.generate(SaveCodec.record("baseUrl",base+"/parallel/"+index,"model","fixture-model"),"fixture-not-real",materials,new AiClient.Request())));
+            }
+            for (Future<JSONObject> response : parallel) ContractTests.check("测试火山".equals(response.get(10,TimeUnit.SECONDS).opt("name")));
+            AiClient.Request cancelOne = new AiClient.Request();
+            Future<String> cancelled = workers.submit(() -> {
+                try {
+                    client.generate(SaveCodec.record("baseUrl",base+"/parallel-cancel/cancel-me","model","fixture-model"),"fixture-not-real",materials,cancelOne);
+                    return "unexpected success";
+                } catch (Fault error) { return error.code; }
+            });
+            List<Future<JSONObject>> others = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                final int index = i;
+                others.add(workers.submit(() -> client.generate(SaveCodec.record("baseUrl",base+"/parallel-cancel/"+index,"model","fixture-model"),"fixture-not-real",materials,new AiClient.Request())));
+            }
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!Files.exists(directory.resolve("cancel-ready.txt")) && System.nanoTime() < deadline) Thread.sleep(10);
+            ContractTests.check(Files.exists(directory.resolve("cancel-ready.txt")));
+            cancelOne.cancel();
+            ContractTests.check("CANCELLED".equals(cancelled.get(5,TimeUnit.SECONDS)));
+            for (Future<JSONObject> response : others) ContractTests.check("测试火山".equals(response.get(10,TimeUnit.SECONDS).opt("name")));
+        } finally { workers.shutdownNow();client.close(); }
+        // 模型答案已验证后的取消保留提交机会，连接检测取消仍不得覆盖旧配置。
+        AiClient.Request receivedAnswer=new AiClient.Request();receivedAnswer.preserveResult=true;receivedAnswer.responseReady=true;
+        receivedAnswer.cancel();receivedAnswer.check();ContractTests.check(receivedAnswer.cancelled);
+        AiClient.Request configured=new AiClient.Request();configured.responseReady=true;configured.cancel();
+        ContractTests.error("CANCELLED",configured::check);
+        JSONArray hits=SaveCodec.parseArray(new String(Files.readAllBytes(directory.resolve("network-hits.json")),StandardCharsets.UTF_8));ContractTests.check(hits.length()==15);
         for(int i=0;i<hits.length();i++){JSONObject hit=SaveCodec.obj(hits.opt(i));ContractTests.check("POST".equals(hit.opt("method"))&&Boolean.TRUE.equals(hit.opt("fixtureAuthenticated"))&&!SaveCodec.str(hit.opt("path")).contains("trap"));JSONObject body=SaveCodec.obj(hit.opt("body"));ContractTests.check(!body.has("thinking")&&Boolean.FALSE.equals(body.opt("stream")));JSONArray messages=SaveCodec.arr(body.opt("messages"),2);JSONObject content=SaveCodec.parse(SaveCodec.str(SaveCodec.obj(messages.opt(1)).opt("content")));JSONArray ms=SaveCodec.arr(content.opt("materials"),4);ContractTests.check(ms.length()==2&&SaveCodec.same(ms.opt(0),ms.opt(1)));boolean custom=SaveCodec.str(hit.opt("path")).startsWith("/theme/");ContractTests.check(client.systemPrompt(custom?customPrompt:"").equals(SaveCodec.obj(messages.opt(0)).opt("content")));if(custom)ContractTests.check("苔光花园世界主题".equals(SaveCodec.arr(content.opt("worldThemes"),16).opt(0)));}
         JSONObject result=SaveCodec.record("passed",ContractTests.checks,"requestsObserved",hits.length(),"redirectsFollowed",0,"provider","loopback HTTPS fixture only","realKeyUsed",false);Files.write(directory.resolve("network-results.json"),result.toString().getBytes(StandardCharsets.UTF_8));System.out.println(result.toString());
     }

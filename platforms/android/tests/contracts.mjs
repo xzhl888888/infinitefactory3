@@ -51,7 +51,10 @@ if(mode==='prepare'){
   for(const [label,save] of [['mod-installed-disabled',installed],['mod-enabled-seed',enabled],['mod-action',action],['mod-combined-state',modCombined],['mod-removed-history-retained',removed]])add(label,save);
   const skin=structuredClone(installed);skin.preferences.skinId='mod/test.mod/skins/silver';add('disabled-mod-appearance-retained',skin);
   transitions.push({label:'mod-install',current:fresh,next:installed,pending:null,clear:false},{label:'mod-enable-seed',current:installed,next:enabled,pending:null,clear:false},{label:'mod-action-card-state',current:enabled,next:action,pending:null,clear:false},{label:'mod-result-state-commit',current:enabled,next:modCombined,pending:localPending,clear:true},{label:'mod-remove-keeps-history',current:modCombined,next:removed,pending:null,clear:false});
-  transitions.push({label:'ai-pending-not-processed',current:fresh,next,pending:{...pending,modProcessed:false},error:'PENDING_MOD_PROCESSING'});
+  // 无启用 Mod 的新档直接提交原答案；启用项仍须完成处理才能提交。
+  transitions.push({label:'ai-pending-without-mods',current:fresh,next,pending:{...pending,modProcessed:false},clear:true});
+  transitions.push({label:'ai-pending-with-disabled-mod',current:installed,next:commitSynthesis(installed,pending).save,pending:{...pending,modProcessed:false},clear:true});
+  transitions.push({label:'reject-unprocessed-enabled-mod',current:enabled,next:modCombined,pending:{...localPending,modProcessed:false},error:'PENDING_MOD_PROCESSING'});
   const wrongState=structuredClone(modCombined);wrongState.mods[0].state={growth:999};transitions.push({label:'reject-pending-mod-state-tamper',current:enabled,next:wrongState,pending:localPending,error:'OPERATION_CONFLICT'});
   const cachedPending={saveId:modCombined.id,operationId:'cached-mod',ingredientIds:['base:fire','base:water'],result:manifest.cards[0],now:'2026-10-27T00:00:06.000Z',source:{kind:'recipe'},modStates:[{id:'test.mod',state:{growth:3}}],modProcessed:true};
   const cached=commitSynthesis(modCombined,cachedPending).save;transitions.push({label:'cached-recipe-after-combine-state',current:modCombined,next:cached,pending:cachedPending,clear:true});add('cached-recipe-history-source',cached);
@@ -68,7 +71,11 @@ if(mode==='prepare'){
   const gardenInstalled=installMod(fresh,garden,{now:'2026-10-27T00:00:10.000Z'}),gardenEnabled=toggleMod(gardenInstalled,garden.id,true,'2026-10-27T00:00:11.000Z');
   add('real-garden-save-export-roundtrip',gardenEnabled);transitions.push({label:'real-garden-install',current:fresh,next:gardenInstalled,pending:null,clear:false},{label:'real-garden-enable',current:gardenInstalled,next:gardenEnabled,pending:null,clear:false});
   const promptCases=[{custom:'',materials:[c.BASE_CARDS[0],c.BASE_CARDS[1]],themes:[]},{custom:'  以童话风格创作。\n\t不省略重复材料。\r\n',materials:[c.BASE_CARDS[2],c.BASE_CARDS[2],c.BASE_CARDS[3]],themes:['苔光花园世界主题']}].map(value=>({...value,expected:buildSynthesisMessages(value.materials,value.themes,value.custom)}));
-  fs.writeFileSync(`${directory}/fixture.json`,JSON.stringify({catalog,cases,transitions,modCases,promptCases}));
+  const secondPending={...pending,operationId:'op-second',ingredientIds:['base:water','base:fire'],result:{name:'蒸汽',emoji:'☁️',category:'自然',description:'水遇热后升起。'},now:'2026-10-27T00:00:02.000Z'};
+  const afterSecond=commitSynthesis(fresh,secondPending).save;
+  // 真设备存储测试也使用正式 reducer 生成预期快照，避免再维护一套合成规则。
+  const deviceCases={fresh,firstPending:pending,secondPending,afterSecond,afterBoth:commitSynthesis(afterSecond,pending).save};
+  fs.writeFileSync(`${directory}/fixture.json`,JSON.stringify({catalog,cases,transitions,modCases,promptCases,deviceCases}));
 } else if(mode==='verify'){
   const fixture=JSON.parse(fs.readFileSync(`${directory}/fixture.json`));const output=JSON.parse(fs.readFileSync(`${directory}/results.json`));
   for(const [index,item] of output.saves.entries()){const expected=fixture.cases[index];assert.equal(item.label,expected.label);if(expected.error)assert.equal(item.error,expected.error,expected.label);else{assert.equal(item.error,undefined,expected.label);assert.deepEqual(validateSave(item.save),expected.expected,expected.label);assert.equal(JSON.stringify(item.save).includes('fixture-secret-not-a-key'),false,'no unknown secrets');}}

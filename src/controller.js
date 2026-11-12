@@ -13,9 +13,12 @@ const MESSAGES = {
   AUTH_FAILED: 'Key 无效或没有访问权限，请检查配置。', NO_BALANCE: '模型服务余额不足，请到服务商处检查。',
   MODEL_NOT_FOUND: '找不到这个模型，请检查模型名称。', RATE_LIMITED: '模型服务暂时限流，请稍后再试。',
   SERVER_ERROR: '模型服务暂时不可用，请稍后再试。', REQUEST_FAILED: '未能连接模型服务，请检查网络和服务地址。',
-  REQUEST_TIMEOUT: '等待模型结果超时，可以稍后重试。', REDIRECT_REJECTED: '服务地址发生跳转，请核对并填写最终服务地址。',
+  REQUEST_TIMEOUT: '等待模型响应超时，请检查网络或稍后重试。', REDIRECT_REJECTED: '服务地址发生跳转，请核对并填写最终服务地址。',
   RESPONSE_TOO_LARGE: '模型返回的内容过长，请调整模型设置。', INVALID_CARD_RESULT: '模型返回的卡牌格式不符合要求，请重试或更换模型。',
   INVALID_JSON: '模型没有返回有效的卡牌数据，请重试或更换模型。', INVALID_RESPONSE: '模型没有返回有效的卡牌数据。',
+  SYNTHESIS_LIMIT: '已有 4 组合成在进行，请等其中一组完成。',
+  SYNTHESIS_ALREADY_RUNNING: '这个组合正在合成。',
+  MIGRATION_BACKUP_FAILED: '升级前的存档副本未能保存，请检查剩余空间后重试。',
   CANCELLED: '已停止等待。模型服务可能仍会计算这次请求的费用。', BUSY: '请等当前操作结束。',
   REVISION_CONFLICT: '存档已经发生变化，请重新打开游戏后再试。',
   UNSUPPORTED_SAVE_VERSION: '这个存档的格式版本暂不支持，原进度没有改变。',
@@ -126,13 +129,43 @@ function checkedSlotName(value) {
 
 // 所有写操作进入同一条队列，布局/外观保存不能覆盖刚完成的合成。
 export function createController(platform, render, { now = () => new Date().toISOString(), uuid = () => crypto.randomUUID(), confirmImport = () => true, modRuntime = createModRuntime() } = {}) {
-  let state = { save: null, library: null, saveEpoch: 0, configStatus: { ...DEFAULT_AI_CONFIG, configured: false }, busy: false, error: '', fileFeedback: null, modFeedback: null, modCandidate: null, lastResult: null, synthesis: null, mode: platform.mode, canRetrySave: false, recoveryRequired: false, pendingBlocked: false, backups: null, backupWarning: false };
-  let writeQueue = Promise.resolve(), pending = null, saving = null, requestEpoch = 0, skipPendingMods = false;
+  let state = { save: null, library: null, saveEpoch: 0, configStatus: { ...DEFAULT_AI_CONFIG, configured: false }, busy: false, error: '', fileFeedback: null, modFeedback: null, modCandidate: null, lastResult: null, synthesis: null, syntheses: [], synthesisLimit: 4, activeSynthesisCount: 0, canCombine: true, mode: platform.mode, canRetrySave: false, recoveryRequired: false, pendingBlocked: false, backups: null, backupWarning: false };
+  let writeQueue = Promise.resolve(), requestEpoch = 0;
+  const pending = new Map(), jobs = new Map(), saving = new Map();
+  const runningPhases = new Set(['requesting', 'saving', 'save-failed', 'queued']);
+
   const show = patch => { state = { ...state, ...patch }; render(state); };
-  // 动画只读这份操作状态；答案留在 pending 中，提交成功前不向视图发布结果卡。
-  const showSynthesisPhase = (id, phase, patch = {}) => {
-    if (state.synthesis?.id === id) show({ ...patch, synthesis: { ...state.synthesis, phase } });
-  };
+  // 每组合成只发布自己的阶段。答案只有在提交后才交给动画揭晓。
+  function publishJobs(id, patch = {}) {
+    const syntheses = [...jobs.values()].map(item => ({
+      id: item.id, ingredientIds: item.ingredientIds.slice(), source: item.source,
+      phase: item.phase, startedAt: item.startedAt, error: item.error || '',
+      canRetrySave: item.phase === 'save-failed', result: item.phase === 'committed' ? item.result : null,
+    }));
+    const active = syntheses.filter(item => runningPhases.has(item.phase));
+    const canRetrySave = syntheses.some(item => item.canRetrySave);
+    const exclusive = state.busy && !['combine', 'save', 'cancel'].includes(state.busy);
+    const busy = exclusive ? state.busy : active.some(item => item.phase === 'requesting')
+      ? 'combine' : active.some(item => item.phase === 'saving') ? 'save' : [...jobs.values()].some(item => item.cancelling) ? 'cancel' : false;
+    const latest = syntheses.at(-1);
+    const legacy = latest ? { id: latest.id, ingredientIds: latest.ingredientIds.slice(), source: latest.source, phase: latest.phase } : null;
+    show({ ...patch, syntheses, synthesis: legacy, lastResult: latest?.result || null,
+      activeSynthesisCount: active.length, canRetrySave, busy,
+      canCombine: active.length < state.synthesisLimit && !canRetrySave && !state.pendingBlocked,
+    });
+  }
+  function phase(job, value, error = '') {
+    job.phase = value; job.error = error;
+    const latest = [...jobs.keys()].at(-1);
+    const patch = error && (latest === job.id || value === 'save-failed') ? { error } : {};
+    if (['saving', 'committed'].includes(value)) patch.error = [...jobs.values()].find(item => item.phase === 'save-failed')?.error || '';
+    publishJobs(job.id, patch);
+  }
+  function resetJobs() {
+    ++requestEpoch;
+    jobs.clear(); pending.clear(); saving.clear();
+    show({ syntheses: [], synthesis: null, activeSynthesisCount: 0, canRetrySave: false, canCombine: true });
+  }
   const enqueue = fn => { const task = writeQueue.then(fn); writeQueue = task.catch(() => {}); return task; };
   async function persist(snapshot) {
     const committed = await platform.save(validateSave(snapshot), state.save.revision);
@@ -146,9 +179,7 @@ export function createController(platform, render, { now = () => new Date().toIS
     const library = checkedLibrary(result?.library), clean = result?.save === null ? null : validateSave(result?.save);
     const slot = library.slots.find(item => item.id === library.activeSlotId);
     if ((clean && (!slot.available || slot.saveId !== clean.id)) || (!clean && slot.available)) throw Error('LIBRARY_CORRUPT');
-    ++requestEpoch;
-    pending = null;
-    skipPendingMods = false;
+    resetJobs();
     show({ save: clean, library, saveEpoch: state.saveEpoch + 1, lastResult: null, synthesis: null, canRetrySave: false,
       recoveryRequired: !clean, pendingBlocked: false, backups: null, modCandidate: null, modFeedback: null, error: clean ? '' : MESSAGES.STORAGE_CORRUPT, fileFeedback: clean && message ? { action: 'slot', kind: 'success', message } : null });
     if (clean && platform.loadPending) {
@@ -159,60 +190,186 @@ export function createController(platform, render, { now = () => new Date().toIS
     catch (e) { if (!state.error) show({ error: errorText(e) }); }
   }
   async function changeSlot(kind, action, message) {
-    if (state.busy || pending || state.canRetrySave) return;
+    if (state.busy || pending.size || state.canRetrySave) return;
     show({ busy: kind, error: '', fileFeedback: null });
     try { await writeQueue; await acceptSlot(await action(), message); }
     catch (e) { show({ error: errorText(e) }); }
     finally { show({ busy: false }); }
   }
-  async function recoverPending() {
-    const journal = await platform.loadPending();
-    if (journal === null) return false;
-    const checked = checkedPending(journal, state.save);
-    if (checked.alreadyCommitted) return false;
-    pending = checked.operation;
-    skipPendingMods = false;
-    let message = '上次的合成结果还没有保存，点“重试保存”继续。';
-    if(!pending.modProcessed&&state.save.mods?.some(mod=>mod.enabled)){
-      try{
-        const output=await modRuntime.process(state.save,pending.ingredientIds,pending.result,{operationId:pending.operationId,source:pending.source||{kind:'ai'},modStates:pending.modStates||[],cached:pending.source?.kind==='recipe'});
-        const operation={operationId:pending.operationId,result:output?.result||pending.result,source:output?.source||pending.source||{kind:'ai'},modStates:output?.modStates||pending.modStates||[]};
-        const updated=await platform.updatePending(operation);
-        const next=checkedPending(updated,state.save);
-        if(next.operation.operationId!==pending.operationId||recipeKey(next.operation.ingredientIds)!==recipeKey(pending.ingredientIds))throw Error('PENDING_MISMATCH');
-        pending=next.operation;
-      }catch{skipPendingMods=true;message=MESSAGES.MOD_PROCESS_FAILED;}
+  async function recoverPending(operationId) {
+    let journals;
+    if (operationId) {
+      const item = await platform.loadPending(operationId);
+      journals = item ? [item] : [];
+    } else if (platform.listPending) journals = await platform.listPending();
+    else {
+      const item = await platform.loadPending();
+      journals = item ? [item] : [];
     }
-    show({ canRetrySave: true, pendingBlocked: false, lastResult: null, error: message,
-      synthesis: { id: pending.operationId, ingredientIds: pending.ingredientIds, source: 'ai', phase: 'save-failed' } });
-    return true;
+    if (!Array.isArray(journals)) throw Error('PENDING_INVALID');
+    let found = false;
+    for (const journal of journals) {
+      const checked = checkedPending(journal, state.save);
+      if (checked.alreadyCommitted) continue;
+      const operation = checked.operation, id = operation.operationId;
+      if (operationId && id !== operationId) throw Error('PENDING_MISMATCH');
+      pending.set(id, operation);
+      const job = jobs.get(id) || { id, ingredientIds: operation.ingredientIds.slice(),
+        source: operation.source?.kind || 'ai', startedAt: Date.now() };
+      job.journaled = true; job.phase = 'save-failed';
+      job.error = '上次的合成结果还没有保存，点“重试保存”继续。';
+      if (journals.length === 1 && state.save.mods?.some(mod => mod.enabled) && !operation.modProcessed) {
+        try { pending.set(id, await preparePending(job, operation)); }
+        catch { job.skipMods = true; job.error = MESSAGES.MOD_PROCESS_FAILED; }
+      }
+      jobs.set(id, job); publishJobs(id, { error: job.error, pendingBlocked: false });
+      found = true;
+    }
+    return found;
   }
-  function savePending() {
-    // 连点重试共享同一次提交；已保存的结果不能被第二个回调改成失败。
-    if (saving) return saving;
-    if (!pending) return Promise.resolve();
+
+  // 恢复单项和串行提交共用同一处理入口，脚本/落盘失败均保留模型原答案。
+  async function preparePending(job, raw) {
+    let operation = raw;
+    const usesMods = state.save.mods?.some(mod => mod.enabled);
+    if (usesMods && !operation.modProcessed) {
+      if (!job.skipMods) {
+        try {
+          const output = await modRuntime.process(state.save, operation.ingredientIds, operation.result, {
+            operationId: job.id, source: operation.source || { kind: 'ai' },
+            modStates: operation.modStates || [], cached: operation.source?.kind === 'recipe',
+          });
+          operation = { ...operation, result: validateCardResult(output?.result || operation.result),
+            source: output?.source || operation.source, modStates: output?.modStates || operation.modStates || [] };
+          if (output?.message) show({ modFeedback: { kind: 'success', message: output.message } });
+        } catch { job.skipMods = true; throw Error('MOD_PROCESS_FAILED'); }
+      }
+      operation = { ...operation, modProcessed: true };
+    }
+    if (platform.durablePending && (job.journaled ? usesMods && !raw.modProcessed : usesMods)) {
+      const input = { operationId: job.id, ingredientIds: operation.ingredientIds, result: operation.result,
+        source: operation.source || { kind: 'ai' }, modStates: operation.modStates || [] };
+      try {
+        const journal = job.journaled ? await platform.updatePending(input) : await platform.stageModResult(input);
+        const checked = checkedPending(journal, state.save);
+        if (checked.operation.operationId !== job.id || recipeKey(checked.operation.ingredientIds) !== recipeKey(job.ingredientIds)) throw Error('PENDING_MISMATCH');
+        operation = checked.operation; job.journaled = true;
+      } catch (error) {
+        if (job.journaled) { job.skipMods = true; throw Error('MOD_PROCESS_FAILED'); }
+        throw error;
+      }
+    }
+    return operation;
+  }
+  // 写队列以最新存档处理这一份答案，其他结果始终留在各自的待存记录中。
+  async function commitPendingJob(job) {
+    const raw = pending.get(job.id);
+    if (!raw) return;
+    // Mod返回完整状态。前一份已处理答案提交失败时，后续答案先留在各自日志中，
+    // 避免对旧状态再计算并在补存时覆盖已经完成的玩法进度。
+    if (state.save.mods?.some(mod => mod.enabled)) {
+      const order = [...pending.keys()];
+      const earlier = order.slice(0, order.indexOf(job.id));
+      if (earlier.some(id => ['save-failed', 'queued'].includes(jobs.get(id)?.phase))) {
+        phase(job, 'queued');
+        return;
+      }
+    }
+    phase(job, 'saving');
+    const operation = await preparePending(job, raw);
+    pending.set(job.id, operation);
+    const result = commitSynthesis(state.save, operation);
+    if (!result.alreadyCommitted) await persist(result.save);
+    pending.delete(job.id);
+    job.result = { operationId: job.id, card: result.card, isNewCard: result.isNewCard, isNewRecipe: result.isNewRecipe };
+    phase(job, 'committed');
+  }
+  function saveFailure(job, error) {
+    const code = String(error?.code || error?.message || error);
+    const message = code === 'MOD_PROCESS_FAILED' ? MESSAGES.MOD_PROCESS_FAILED
+      : /^(STORAGE_)?REVISION_CONFLICT/.test(code) ? MESSAGES.REVISION_CONFLICT : MESSAGES.SAVE_WRITE_FAILED;
+    phase(job, 'save-failed', message);
+  }
+  function savePending(operationId) {
     if (state.busy && !['combine', 'save'].includes(state.busy)) return Promise.resolve();
-    let operation = pending;
-    showSynthesisPhase(operation.operationId, 'saving', { busy: 'save', error: '' });
-    saving = enqueue(async () => {
-        // 玩家已明确点击保存原答案；先把“跳过失败脚本”也记入日志，重开不能再重跑一次。
-        if(skipPendingMods&&platform.durablePending){
-          const updated=checkedPending(await platform.updatePending({operationId:operation.operationId,result:operation.result,source:operation.source||{kind:'ai'},modStates:operation.modStates||[]}),state.save);
-          if(updated.operation.operationId!==operation.operationId||recipeKey(updated.operation.ingredientIds)!==recipeKey(operation.ingredientIds))throw Error('PENDING_MISMATCH');
-          operation=pending=updated.operation;skipPendingMods=false;
+    if (!operationId && pending.size === 1) return savePending(pending.keys().next().value);
+    if (!operationId) return [...pending.keys()].reduce((task, id) => task.then(() => savePending(id)), Promise.resolve());
+    if (saving.has(operationId)) return saving.get(operationId);
+    const job = jobs.get(operationId);
+    if (!job || !pending.has(operationId)) return Promise.resolve();
+    const task = enqueue(() => commitPendingJob(job))
+      .catch(error => saveFailure(job, error))
+      .finally(() => {
+        saving.delete(operationId); publishJobs(operationId);
+        if (job.phase === 'committed') {
+          for (const id of pending.keys()) if (jobs.get(id)?.phase === 'queued') void savePending(id);
         }
-        const result = commitSynthesis(state.save, operation);
-        if (!result.alreadyCommitted) await persist(result.save);
-        pending = null;
-        skipPendingMods = false;
-        showSynthesisPhase(operation.operationId, 'committed', {
-          lastResult: { operationId: operation.operationId, card: result.card, isNewCard: result.isNewCard, isNewRecipe: result.isNewRecipe }, canRetrySave: false,
+      });
+    saving.set(operationId, task);
+    return task;
+  }
+  async function runSynthesis(job, epoch) {
+    let checkingJournal = false;
+    try {
+      const ids = job.ingredientIds, known = findRecipe(state.save, ids);
+      const usesMods = state.save.mods?.some(mod => mod.enabled);
+      if (known) {
+        pending.set(job.id, { operationId: job.id, ingredientIds: ids,
+          result: usesMods ? validateCardResult(state.save.cards.find(card => card.id === known.resultId)) : null,
+          source: { kind: 'recipe' }, now: now(), modProcessed: !usesMods });
+        await savePending(job.id); return;
+      }
+      if (usesMods) {
+        let resolved = false;
+        await enqueue(async () => {
+          if (job.phase === 'cancelled' || epoch !== requestEpoch) return;
+          const local = await modRuntime.resolve(state.save, ids, job.id);
+          if (!local) return;
+          resolved = true; job.source = 'mod';
+          pending.set(job.id, { operationId: job.id, ingredientIds: ids, result: validateCardResult(local.result),
+            source: local.source, modStates: local.modStates || [], now: now(), modProcessed: true });
+          try { await commitPendingJob(job); } catch (error) { saveFailure(job, error); }
+          if (local.message) show({ modFeedback: { kind: 'success', message: local.message } });
         });
-      }).catch(e => {
-        const conflict = /^(STORAGE_)?REVISION_CONFLICT/.test(String(e?.code || e?.message || e));
-        showSynthesisPhase(operation.operationId, 'save-failed', { error: conflict ? MESSAGES.REVISION_CONFLICT : MESSAGES.SAVE_WRITE_FAILED, canRetrySave: true });
-      }).finally(() => { saving = null; show({ busy: false }); });
-    return saving;
+        if (resolved || job.phase === 'cancelled' || epoch !== requestEpoch) return;
+      }
+      if (!state.configStatus.configured) throw Error('KEY_REQUIRED');
+      job.source = 'ai'; publishJobs(job.id);
+      const result = validateCardResult(await platform.generate(ids, job.id));
+      if (epoch !== requestEpoch) return;
+      if (platform.durablePending) {
+        checkingJournal = true;
+        const checked = checkedPending(await platform.loadPending(job.id), state.save);
+        if (checked.operation.operationId !== job.id || recipeKey(checked.operation.ingredientIds) !== recipeKey(ids)
+          || JSON.stringify(checked.operation.result) !== JSON.stringify(result)) throw Error('PENDING_MISMATCH');
+        pending.set(job.id, checked.operation); job.journaled = true; checkingJournal = false;
+      } else pending.set(job.id, { operationId: job.id, ingredientIds: ids, result, source: { kind: 'ai' }, now: now() });
+      if (job.cancelRequested) {
+        if (!platform.durablePending) { pending.delete(job.id); return; }
+        phase(job, 'save-failed', '这次合成已经收到结果，点“重试保存”保留这张卡。');
+        return;
+      }
+      await savePending(job.id);
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (String(error?.code || error?.message) === 'PENDING_SAVE_REQUIRED') {
+        phase(job, 'failed', errorText(error));
+        try { if (await recoverPending()) return; }
+        catch (recoveryError) { error = recoveryError; checkingJournal = true; }
+      }
+      if (job.cancelRequested) {
+        if (platform.durablePending) {
+          try { if (await recoverPending(job.id)) return; }
+          catch (recoveryError) { error = recoveryError; checkingJournal = true; }
+        }
+      }
+      if (pending.has(job.id)) saveFailure(job, error);
+      else {
+        const cancelled = job.cancelRequested;
+        phase(job, cancelled ? 'cancelled' : 'failed', cancelled ? MESSAGES.CANCELLED : errorText(error));
+        if (checkingJournal) show({ pendingBlocked: true, canCombine: false });
+      }
+    } finally { publishJobs(job.id); }
   }
   const callbacks = {
     async onConfigure(config) {
@@ -223,91 +380,49 @@ export function createController(platform, render, { now = () => new Date().toIS
       catch (e) { if (epoch === requestEpoch) show({ error: errorText(e) }); }
       finally { config.key = ''; if (epoch === requestEpoch) show({ busy: false }); }
     },
-    async onCombine(ingredientIds) {
-      if (state.busy || pending || state.pendingBlocked || !state.save) return;
-      const epoch = ++requestEpoch;
-      const operationId = uuid();
-      let synthesis, checkingJournal = false;
-      try {
-        // 将同一材料选择固定在操作上，迟到响应不能改成玩家后续的选择。
-        const ids = [...ingredientIds];
-        const known = findRecipe(state.save, ids);
-        const usesMods = state.save.mods?.some(mod => mod.enabled);
-        // 已记录配方只使用本地答案，凭据丢失不能锁住玩家已有进度。
-        if (!known && !usesMods && !state.configStatus.configured) { show({ error: MESSAGES.KEY_REQUIRED }); return; }
-        synthesis = { id: operationId, ingredientIds: ids, source: known ? 'cache' : usesMods ? 'mod' : 'ai', phase: known ? 'saving' : 'requesting' };
-        // 本地配方直接保存；不伪造模型等待，也不为动画延迟实际提交。
-        show({ busy: known ? 'save' : 'combine', error: '', lastResult: null, canRetrySave: false, synthesis });
-        const local = !known && usesMods ? await modRuntime.resolve(state.save, ids, operationId) : null;
-        if (epoch !== requestEpoch) return;
-        let result = known && usesMods ? validateCardResult(state.save.cards.find(card=>card.id===known.resultId)) : local ? validateCardResult(local.result) : null;
-        let source = known ? {kind:'recipe'} : local?.source || {kind:'ai'}, modStates = local?.modStates || [];
-        let aiResult = false;
-        if (!known && !local) {
-          if (!state.configStatus.configured) { showSynthesisPhase(operationId,'failed',{error:MESSAGES.KEY_REQUIRED}); return; }
-          show({ synthesis: { ...state.synthesis, source: 'ai' } });
-          result = validateCardResult(await platform.generate(ids, operationId));
-          if (epoch !== requestEpoch) return;
-          aiResult = true;
-        }
-        if (aiResult && platform.durablePending) {
-          checkingJournal = true;
-          const journal = checkedPending(await platform.loadPending(), state.save);
-          if (epoch !== requestEpoch) return;
-          if (journal.operation.operationId !== operationId || recipeKey(journal.operation.ingredientIds) !== recipeKey(ids) || JSON.stringify(journal.operation.result) !== JSON.stringify(result)) throw Error('PENDING_MISMATCH');
-          pending = journal.operation;
-          checkingJournal = false;
-        } else if (!usesMods) pending = { operationId, ingredientIds: ids, result, source, now: now() };
-        if (usesMods) {
-          try {
-            // resolve 已包含本地答案的 transform/afterCombine，不能在这里重复执行状态更新。
-            const output = local || await modRuntime.process(state.save,ids,result,{operationId,source,modStates,cached:!!known});
-            if (epoch !== requestEpoch) return;
-            result = validateCardResult(output?.result || result);source = output?.source || source;modStates = output?.modStates || modStates;
-            const operation = { operationId, ingredientIds: ids, result, source, modStates };
-            if (platform.durablePending) {
-              const journal = aiResult ? await platform.updatePending(operation) : await platform.stageModResult(operation);
-              if (epoch !== requestEpoch) return;
-              const checked = checkedPending(journal,state.save);
-              if(checked.operation.operationId!==operationId||recipeKey(checked.operation.ingredientIds)!==recipeKey(ids))throw Error('PENDING_MISMATCH');
-              pending = checked.operation;
-            } else pending = {...operation,now:now()};
-            if(output?.message||local?.message)show({modFeedback:{kind:'success',message:output?.message||local.message}});
-          } catch (modError) {
-            // AI 原始答案已经持久化。脚本失败只暂停提交，不丢掉已付费结果，也不自动重跑脚本。
-            if (aiResult && pending) { skipPendingMods=true;showSynthesisPhase(operationId,'save-failed',{error:MESSAGES.MOD_PROCESS_FAILED,canRetrySave:true});return; }
-            throw modError;
-          }
-        }
-        await savePending();
-      } catch (e) {
-        if (epoch === requestEpoch) {
-          // 取消和答案落盘可能交错。原生已保存答案时，只恢复这份结果，不发第二次付费请求。
-          if (platform.durablePending && String(e?.code || e?.message || e) === 'PENDING_SAVE_REQUIRED') {
-            try { if (await recoverPending()) return; }
-            catch (recoveryError) { e = recoveryError; checkingJournal = true; }
-          }
-          if (synthesis) showSynthesisPhase(operationId, 'failed', { error: errorText(e), ...(checkingJournal ? { pendingBlocked: true } : {}) });
-          else show({ error: errorText(e) });
-        }
+    onCombine(ingredientIds) {
+      if (!state.save || state.pendingBlocked || state.canRetrySave
+        || state.busy && !['combine', 'save'].includes(state.busy)) return;
+      let key;
+      try { key = recipeKey(ingredientIds); } catch (error) { show({ error: errorText(error) }); return; }
+      const existing = [...jobs.values()].find(job => runningPhases.has(job.phase) && recipeKey(job.ingredientIds) === key);
+      if (existing) { show({ error: MESSAGES.SYNTHESIS_ALREADY_RUNNING }); return existing.promise; }
+      if ([...jobs.values()].filter(job => runningPhases.has(job.phase)).length >= state.synthesisLimit) {
+        show({ error: MESSAGES.SYNTHESIS_LIMIT }); return;
       }
-      finally { if (epoch === requestEpoch) show({ busy: false }); }
+      const known = findRecipe(state.save, ingredientIds);
+      if (!known && !state.save.mods?.some(mod => mod.enabled) && !state.configStatus.configured) {
+        show({ error: MESSAGES.KEY_REQUIRED }); return;
+      }
+      // 材料与身份在开始时固定，其他任务完成和后续选择都不能改写这一组。
+      const job = { id: uuid(), ingredientIds: ingredientIds.slice(), startedAt: Date.now(),
+        source: known ? 'cache' : state.save.mods?.some(mod => mod.enabled) ? 'mod' : 'ai',
+        phase: known ? 'saving' : 'requesting', journaled: false };
+      for (const [id, item] of jobs) {
+        if (jobs.size <= 32) break;
+        if (['committed', 'failed', 'cancelled'].includes(item.phase)) jobs.delete(id);
+      }
+      jobs.set(job.id, job); publishJobs(job.id, { error: '' });
+      job.promise = runSynthesis(job, requestEpoch);
+      return job.promise;
     },
-    async onCancel() {
-      if (!['combine', 'configure'].includes(state.busy)) return;
-      const cancellingSynthesis = state.busy === 'combine' ? state.synthesis : null;
-      const epoch = ++requestEpoch;
-      // 立即终止本次视觉等待；取消配置不能改动之前合成的已提交／待存状态。
-      show({ busy: 'cancel', ...(cancellingSynthesis ? { synthesis: { ...cancellingSynthesis, phase: 'cancelled' } } : {}) });
-      if(cancellingSynthesis)modRuntime.dispose?.();
-      try { await platform.cancel(); } catch {}
-      if (epoch === requestEpoch) {
-        if (cancellingSynthesis && platform.durablePending) {
-          try { if (await recoverPending()) { show({ busy: false }); return; } }
-          catch (e) { show({ busy: false, pendingBlocked: true, error: errorText(e) }); return; }
-        }
-        show({ busy: false, error: MESSAGES.CANCELLED });
+    async onCancel(operationId) {
+      if (state.busy === 'configure') {
+        const epoch = ++requestEpoch; show({ busy: 'cancel' });
+        try { await platform.cancel(); } catch {}
+        if (epoch === requestEpoch) show({ busy: false, error: MESSAGES.CANCELLED });
+        return;
       }
+      const targets = [...jobs.values()].filter(job => job.phase === 'requesting' && (!operationId || job.id === operationId));
+      await Promise.all(targets.map(async job => {
+        job.cancelRequested = true; job.cancelling = true; phase(job, 'cancelled', MESSAGES.CANCELLED);
+        try { await platform.cancel(job.id); } catch {}
+        job.cancelling = false; publishJobs(job.id);
+        if (platform.durablePending) {
+          try { await recoverPending(job.id); }
+          catch (error) { show({ pendingBlocked: true, canCombine: false, error: errorText(error) }); }
+        }
+      }));
     },
     onRetrySave: savePending,
     async onRefreshLibrary() {
@@ -326,7 +441,7 @@ export function createController(platform, render, { now = () => new Date().toIS
       return changeSlot('switch-slot', () => platform.switchSlot(id), '已切换存档。');
     },
     async onRenameSlot(id, name) {
-      if (state.busy || pending || state.canRetrySave || !platform.renameSlot || !state.library?.slots.some(slot => slot.id === id)) return;
+      if (state.busy || pending.size || state.canRetrySave || !platform.renameSlot || !state.library?.slots.some(slot => slot.id === id)) return;
       show({ busy: 'rename-slot', error: '' });
       try {
         await writeQueue;
@@ -336,7 +451,7 @@ export function createController(platform, render, { now = () => new Date().toIS
       finally { show({ busy: false }); }
     },
     async onChooseMod() {
-      if(state.busy||pending||!state.save||!platform.chooseModFile)return;
+      if(state.busy||pending.size||!state.save||!platform.chooseModFile)return;
       show({busy:'mod-import',error:'',modFeedback:null,modCandidate:null});
       try {const text=await platform.chooseModFile();if(text!==null)show({modCandidate:validateModPackage(text)});}
       catch(e){show({error:errorText(e),modFeedback:{kind:'error',message:errorText(e)}});}
@@ -350,7 +465,7 @@ export function createController(platform, render, { now = () => new Date().toIS
     async onToggleMod(id,enabled){return modifyMod(()=>ModModel.toggleMod(state.save,id,enabled,now()),enabled?'Mod 已启用。':'Mod 已停用，已经发现的卡牌和配方会保留。');},
     async onRemoveMod(id){return modifyMod(()=>ModModel.removeMod(state.save,id,now()),'Mod 已移除，已经发现的卡牌和配方会保留。');},
     async onModAction(modId,actionId){
-      if(state.busy||pending||!state.save||state.pendingBlocked)return;
+      if(state.busy||pending.size||!state.save||state.pendingBlocked)return;
       show({busy:'mod-action',error:'',modFeedback:null});
       try{await writeQueue;const output=await modRuntime.action(state.save,modId,actionId);await enqueue(()=>persist(ModModel.applyModAction(state.save,modId,output,now())));show({modFeedback:{kind:'success',message:output?.message||'玩法操作已保存。'}});}
       catch(e){const message=errorText(e);show({error:message,modFeedback:{kind:'error',message}});}
@@ -361,7 +476,7 @@ export function createController(platform, render, { now = () => new Date().toIS
       const saved = await patchSave(save => ({ ...save, preferences: { ...save.preferences, ...patch } }));
       // 提示词重试成功后撤掉旧错误；保存期间新操作的错误和待存提示仍由原操作处理。
       if (saved && Object.hasOwn(patch, 'synthesisPrompt') && previousError && state.error === previousError && epoch === requestEpoch
-        && !state.busy && !pending && !state.canRetrySave && !state.pendingBlocked) show({ error: '' });
+        && !state.busy && !pending.size && !state.canRetrySave && !state.pendingBlocked) show({ error: '' });
       return saved;
     },
     async onSaveFavorites(favorites) { return patchSave(save => ({ ...save, favorites })); },
@@ -384,7 +499,7 @@ export function createController(platform, render, { now = () => new Date().toIS
       finally { show({ busy: false }); }
     },
     async onImport() {
-      if (state.busy || pending || (!state.save && !state.recoveryRequired)) return;
+      if (state.busy || pending.size || (!state.save && !state.recoveryRequired)) return;
       show({ busy: 'import', error: '', fileFeedback: null });
       try {
         await writeQueue;
@@ -400,7 +515,8 @@ export function createController(platform, render, { now = () => new Date().toIS
         const saved = await enqueue(() => platform.importSave(parsed));
         // 同一档案的旧备份仍有相同 id，视图需要明确区分导入和普通写入响应。
         const clean = validateSave(saved);
-        show({ save: clean, saveEpoch: state.saveEpoch + 1, lastResult: null, synthesis: null, recoveryRequired: false, pendingBlocked: false, backups: null, error: '',
+        resetJobs();
+        show({ save: clean, saveEpoch: state.saveEpoch + 1, lastResult: null, synthesis: null, syntheses: [], recoveryRequired: false, pendingBlocked: false, backups: null, error: '',
           fileFeedback: { action: 'import', kind: 'success', message: `存档已导入：${clean.cards.length} 张卡牌，${clean.stats.synthesisCount} 次合成。` } });
       } catch (e) { const message = errorText(e); show({ error: message, fileFeedback: { action: 'import', kind: 'error', message } }); }
       finally { show({ busy: false }); }
@@ -416,19 +532,20 @@ export function createController(platform, render, { now = () => new Date().toIS
       finally { show({ busy: false }); }
     },
     async onRestoreBackup(id) {
-      if (state.busy || pending || !state.backups?.some(item => item.id === id) || !platform.restoreBackup) return;
+      if (state.busy || pending.size || !state.backups?.some(item => item.id === id) || !platform.restoreBackup) return;
       show({ busy: 'restore', error: '', fileFeedback: null });
       try {
         await writeQueue;
         const clean = validateSave(await platform.restoreBackup(id));
-        show({ save: clean, saveEpoch: state.saveEpoch + 1, lastResult: null, synthesis: null, recoveryRequired: false, pendingBlocked: false, backups: null,
+        resetJobs();
+        show({ save: clean, saveEpoch: state.saveEpoch + 1, lastResult: null, synthesis: null, syntheses: [], recoveryRequired: false, pendingBlocked: false, backups: null,
           fileFeedback: { action: 'restore', kind: 'success', message: `存档已恢复：${clean.cards.length} 张卡牌，${clean.stats.synthesisCount} 次合成。` } });
       } catch (e) { const message = errorText(e); show({ error: message, fileFeedback: { action: 'restore', kind: 'error', message } }); }
       finally { show({ busy: false }); }
     },
   };
   async function modifyMod(mutator,message,clearCandidate=false){
-    if(state.busy||pending||!state.save||state.pendingBlocked)return;
+    if(state.busy||pending.size||!state.save||state.pendingBlocked)return;
     show({busy:'mod-save',error:'',modFeedback:null});
     try{await enqueue(()=>persist(mutator()));show({modFeedback:{kind:'success',message},...(clearCandidate?{modCandidate:null}:{})});}
     catch(e){const message=errorText(e);show({error:message,modFeedback:{kind:'error',message}});}

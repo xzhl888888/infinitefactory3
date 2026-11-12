@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-// 只复制运行游戏所需的前端文件，测试用平台适配器不进入安装包。
+// 白名单构建，永不访问旧工程或生产归档。已有产物只覆盖对应文件，不递归删除目录。
 const out = path.join(root, '.build', 'web');
 await mkdir(out, { recursive: true });
 const files = ['index.html'];

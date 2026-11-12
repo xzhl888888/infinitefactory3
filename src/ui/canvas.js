@@ -10,14 +10,16 @@ const waiting = op => op && !op.revealed && !['failed', 'cancelled'].includes(op
 
 // 存档只记卡牌目标位置；抓取、聚拢、卡背和揭晓均是本次操作的临时表现。
 export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => performance.now() } = {}) {
-  const ctx = canvas.getContext('2d'), painter = createCardPainter(ctx,{getMods:()=>save?.mods||[],onAssetReady:()=>{dirty=true;}});
+  const ctx = canvas.getContext('2d'), painter = createCardPainter(ctx,{getMods:()=>save?.mods||[],onAssetReady:()=>{dirty=true;},cacheStatic:true});
   const modImages=createModImages(()=>{dirty=true;}),modAudio=createModAudio();
   let appearanceMods,tabletops=[];
   let width = 1, height = 1, dpr = 1, save = null, revision = null;
   let nodes = [], selectedIds = [], busy = false, enabled = true, prefs = {}, lastPrefZoom = null, saveId = null, saveEpoch = null, viewTouched = false;
   let zoom = 1, pan = { x: 0, y: 0 }, drag = null, pinch = null, ignoreTap = false;
   let raf = 0, destroyed = false, dirty = true, lastFrame = 0, paintedAt = null, hoverId = null, dotPattern = null, audio = null, zoomTimer = null;
-  let operation = null, prepared = null, discovery = null, presentationBusy = false, layoutSignature = null, floats = [];
+  let operations = new Map(), prepared = null, discovery = null, presentationBusy = false, layoutSignature = null, floats = [];
+  let cardIndex = new Map(), canCombine = true, discoveryQueue = [];
+  const occupiedInstances = new Set();
   const ownLayouts = new Set(), pointers = new Map(), disposers = [];
   let instanceSequence = 0;
   let visible = true;
@@ -27,12 +29,12 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
   const position = event => { const r = canvas.getBoundingClientRect(); return { x: (event.clientX-r.left)*width/r.width, y: (event.clientY-r.top)*height/r.height }; };
   const world = point => ({ x: (point.x-width/2-pan.x)/zoom, y: (point.y-height/2-pan.y)/zoom });
   const screen = point => ({ x: width/2+pan.x+point.x*zoom, y: height/2+pan.y+point.y*zoom });
-  const cardFor = id => save?.cards.find(card => card.id === id);
+  const cardFor = id => cardIndex.get(id);
   // 合成只占用本次材料和请求名额，不能让等待模型变成整个台面的输入锁。
   // 文件操作、换档等管理阶段仍由同一入口阻止修改；布局继续走控制器的串行写入。
   const blocked = () => !enabled || (!!busy && !['combine','save','cancel'].includes(busy));
-  const synthesisBlocked = () => blocked() || !!busy || !!waiting(operation) || presentationBusy;
-  const hiddenNode = n => waiting(operation) && operation.nodeIds.includes(n.id);
+  const synthesisBlocked = () => blocked() || !canCombine;
+  const hiddenNode = n => occupiedInstances.has(n.id);
   const hit = point => { const p = world(point); return [...nodes].reverse().find(n => !hiddenNode(n) && Math.abs(p.x-n.px)<WIDTH/2 && Math.abs(p.y-n.py)<HEIGHT/2); };
   const decorate = (n, scale=1) => ({ ...n, px:n.x, py:n.y, scale, targetScale:1 });
   // 等待时仍可拖别的卡；结果揭晓/整理触发保存时，不能顺便落盘尚未松手的位置。
@@ -149,31 +151,49 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
   }
   function prepareSynthesis(ids, screenPoints=[]) {
     if(synthesisBlocked())return false;
-    const anchor=world({x:width*.5,y:height*.4});
-    prepared={anchor,nodeIds:[],ghosts:ids.map((id,i)=>({cardId:id,...world(screenPoints[i]||{x:width*.5+(i-(ids.length-1)/2)*55,y:height-80}),scale:.55}))};
+    const active=[...operations.values()].filter(waiting);
+    const used=new Set(active.map(op=>op.slot));let slot=0;while(used.has(slot))slot++;
+    const center=world({x:width*.5,y:height*.4}),offsets=[[0,0],[WIDTH*1.25,0],[-WIDTH*1.25,0],[0,HEIGHT*1.25]];
+    const offset=offsets[slot%offsets.length],anchor={x:center.x+offset[0],y:center.y+offset[1]};
+    prepared={anchor,slot,nodeIds:[],ghosts:ids.map((id,i)=>({cardId:id,...world(screenPoints[i]||{x:width*.5+(i-(ids.length-1)/2)*55,y:height-80}),scale:.55}))};
     return true;
   }
+  function syncPresentationBusy() {
+    occupiedInstances.clear();let active=false;
+    for(const op of operations.values())if(waiting(op)){active=true;for(const id of op.nodeIds)occupiedInstances.add(id);}
+    setPresentationBusy(active);
+  }
   function beginOperation(next) {
-    const origin=prepared||{anchor:world({x:width*.5,y:height*.4}),nodeIds:[],ghosts:[]};prepared=null;
-    operation={...next,...origin,started:clock(),revealed:false,result:null};
-    setPresentationBusy(true);sound('think');dirty=true;
+    const slot = [...operations.values()].filter(waiting).length;
+    const center=world({x:width*.5,y:height*.4}),offsets=[[0,0],[WIDTH*1.25,0],[-WIDTH*1.25,0],[0,HEIGHT*1.25]],offset=offsets[slot%4];
+    const origin = prepared || {anchor:{x:center.x+offset[0],y:center.y+offset[1]},nodeIds:[],ghosts:[],slot};
+    prepared = null;
+    operations.set(next.id,{...next,...origin,started:clock(),revealed:false,result:next.result||null});
+    syncPresentationBusy(); sound('think'); dirty=true;
   }
-  function restoreOperation() {
-    for(const n of nodes)if(operation.nodeIds.includes(n.id)){n.px=operation.anchor.x;n.py=operation.anchor.y;n.scale=prefs.reduceMotion?1:.4;n.targetScale=1;}
-    operation.restored=true;sound('failure');floatAt({...operation.anchor,y:operation.anchor.y-HEIGHT*.6},operation.phase==='cancelled'?'已取消':'合成未完成',1600);setPresentationBusy(false);dirty=true;
+  function restoreOperation(op) {
+    for(const n of nodes)if(op.nodeIds.includes(n.id)){n.px=op.anchor.x;n.py=op.anchor.y;n.scale=prefs.reduceMotion?1:.4;n.targetScale=1;}
+    op.restored=true; sound('failure');
+    floatAt({...op.anchor,y:op.anchor.y-HEIGHT*.6},op.phase==='cancelled'?'已取消':'合成未完成',1600);
+    syncPresentationBusy(); dirty=true;
   }
-  function revealOperation(now) {
-    const op=operation;if(!op||op.revealed||op.phase!=='committed'||!op.result?.card)return;
-    if(now-op.started<(prefs.reduceMotion?0:op.source==='cache'?260:420))return;
-    // 只有提交成功才替换材料实例。失败及重试保存一直保留原布局。
-    op.revealed=true;
-    nodes=nodes.filter(n=>!op.nodeIds.includes(n.id)||n.pinned);
-    const pinned=nodes.some(n=>op.nodeIds.includes(n.id));
-    const node=decorate({id:newInstanceId(),cardId:op.result.card.id,x:op.anchor.x+(pinned?WIDTH*.75:0),y:op.anchor.y,pinned:false},prefs.reduceMotion?1:.2);
-    nodes.push(node);
-    if(op.result.isNewCard){discovery={id:op.id,card:op.result.card,started:now,particles:createDiscoveryParticles()};sound('discovery');}
-    else{sound('repeat');floatAt({x:node.x,y:node.y-HEIGHT*.6},'合成完成');}
-    persist();emit('onReveal',op.result);setPresentationBusy(false);dirty=true;
+  function revealOperations(now) {
+    for (const op of operations.values()) {
+      if(op.revealed||op.phase!=='committed'||!op.result?.card)continue;
+      if(now-op.started<(prefs.reduceMotion?0:op.source==='cache'?260:420))continue;
+      // 每份结果只替换自己的材料实例。并行任务不能接管彼此的动画或落盘状态。
+      op.revealed=true;
+      nodes=nodes.filter(n=>!op.nodeIds.includes(n.id)||n.pinned);
+      const pinned=nodes.some(n=>op.nodeIds.includes(n.id));
+      const node=decorate({id:newInstanceId(),cardId:op.result.card.id,x:op.anchor.x+(pinned?WIDTH*.75:0),y:op.anchor.y,pinned:false},prefs.reduceMotion?1:.2);
+      nodes.push(node);
+      if(op.result.isNewCard){
+        discoveryQueue.push({id:op.id,card:op.result.card,particles:createDiscoveryParticles()});
+        sound('discovery');
+      }else{sound('repeat');floatAt({x:node.x,y:node.y-HEIGHT*.6},'合成完成');}
+      persist(); emit('onReveal',op.result); dirty=true;
+    }
+    syncPresentationBusy();
   }
   function background() {
     if(appearanceMods!==save?.mods){appearanceMods=save?.mods;tabletops=listModAppearances(appearanceMods||[],'tabletops');}
@@ -193,34 +213,40 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
     const light=ctx.createRadialGradient(width*.5,height*.46,8,width*.5,height*.46,width*.52);light.addColorStop(0,dark?'rgba(170,215,255,.13)':'rgba(255,252,240,.72)');light.addColorStop(1,'rgba(255,252,240,0)');ctx.fillStyle=light;ctx.fillRect(0,0,width,height);
   }
   function advancePresentation(now,dt) {
-    revealOperation(now);
+    revealOperations(now);
     for(const n of nodes){
       n.px=prefs.reduceMotion?n.x:followLegacy(n.px,n.x,.3,dt);n.py=prefs.reduceMotion?n.y:followLegacy(n.py,n.y,.3,dt);n.scale=prefs.reduceMotion?n.targetScale:followLegacy(n.scale,n.targetScale,.22,dt);
       if(Math.abs(n.px-n.x)<.01)n.px=n.x;if(Math.abs(n.py-n.y)<.01)n.py=n.y;if(Math.abs(n.scale-n.targetScale)<.001)n.scale=n.targetScale;
     }
     floats=floats.filter(f=>f.until>now);
     if(discovery&&now-discovery.started>=1500)discovery=null;
+    if(!discovery&&discoveryQueue.length)discovery={...discoveryQueue.shift(),started:now};
   }
   function paint(now) {
     ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,width,height);background();
     ctx.save();ctx.translate(width/2+pan.x,height/2+pan.y);ctx.scale(zoom,zoom);
     for(const n of nodes){
       const card=cardFor(n.cardId);if(!card||hiddenNode(n))continue;
+      const point=screen({x:n.px,y:n.py}),margin=40*zoom;
+      if(point.x+(WIDTH/2*n.scale)*zoom+margin<0||point.x-(WIDTH/2*n.scale)*zoom-margin>width||point.y+(HEIGHT/2*n.scale)*zoom+margin<0||point.y-(HEIGHT/2*n.scale)*zoom-margin>height)continue;
       const picked=selectedIds.indexOf(n.cardId),highlight=picked>=0||hoverId===n.id;
       painter.drawCard(n.px,n.py,WIDTH*n.scale,HEIGHT*n.scale,card,{skinId:prefs.skinId,now,animate:!prefs.reduceMotion,lift:drag?.node===n,selected:highlight,selectionIndex:picked>=0?picked+1:null,rotation:drag?.node===n&&!prefs.reduceMotion?-.05:0});
     }
-    const op=operation,elapsed=op?now-op.started:0;
-    // 补齐材料到卡背的短衔接，不以动画时长猜测网络是否完成。
-    if(waiting(op)&&elapsed<COLLECT_MS&&!prefs.reduceMotion){
-      const t=clamp(elapsed/COLLECT_MS,0,1),ease=1-(1-t)**3;
-      for(const ghost of op.ghosts){const card=cardFor(ghost.cardId);if(!card)continue;ctx.save();ctx.globalAlpha=1-t;
-        const scale=ghost.scale*(1-.25*t);painter.drawCard(ghost.x+(op.anchor.x-ghost.x)*ease,ghost.y+(op.anchor.y-ghost.y)*ease,WIDTH*scale,HEIGHT*scale,card,{skinId:prefs.skinId,now,animate:false});ctx.restore();}
+    // 收集和卡背按任务分别绘制，未占用的实例仍可拖动与继续合成。
+    for(const op of operations.values()) {
+      const elapsed=now-op.started;
+      if(waiting(op)&&elapsed<COLLECT_MS&&!prefs.reduceMotion){
+        const t=clamp(elapsed/COLLECT_MS,0,1),ease=1-(1-t)**3;
+        for(const ghost of op.ghosts){const card=cardFor(ghost.cardId);if(!card)continue;ctx.save();ctx.globalAlpha=1-t;
+          const scale=ghost.scale*(1-.25*t);painter.drawCard(ghost.x+(op.anchor.x-ghost.x)*ease,ghost.y+(op.anchor.y-ghost.y)*ease,WIDTH*scale,HEIGHT*scale,card,{skinId:prefs.skinId,now,animate:false});ctx.restore();}
+      }
     }
     ctx.restore();
-    if(waiting(op)){
-      const p=screen(op.anchor),label=op.phase==='save-failed'?'等待保存':busy==='cancel'?'正在取消':op.phase==='saving'?'正在保存':op.phase==='committed'?'合成中':'造物中';
+    for(const op of operations.values()) {
+      if(!waiting(op))continue;
+      const elapsed=now-op.started,p=screen(op.anchor),label=['save-failed','queued'].includes(op.phase)?'等待保存':op.phase==='saving'?'正在保存':op.phase==='committed'?'合成中':'造物中';
       ctx.save();ctx.globalAlpha=prefs.reduceMotion?1:clamp(elapsed/COLLECT_MS,0,1);
-      drawWaiting(ctx,painter,{...p,scale:zoom,now,cardBackId:prefs.cardBackId,reduceMotion:prefs.reduceMotion||op.phase==='save-failed',label});ctx.restore();
+      drawWaiting(ctx,painter,{...p,scale:zoom,now,cardBackId:prefs.cardBackId,reduceMotion:prefs.reduceMotion||['save-failed','queued'].includes(op.phase),label});ctx.restore();
     }
     for(const f of floats)drawFloatingText(ctx,{...f,...screen(f),reduceMotion:!!prefs.reduceMotion},now);
     if(discovery)drawDiscovery(ctx,painter,{x:width/2,y:height*.44,card:discovery.card,particles:discovery.particles,elapsedMs:now-discovery.started,now,skinId:prefs.skinId,reduceMotion:!!prefs.reduceMotion,label:'首次发现 ✦'});
@@ -228,12 +254,11 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
   function movingNodes(){return nodes.some(n=>Math.abs(n.px-n.x)>.01||Math.abs(n.py-n.y)>.01||Math.abs(n.scale-n.targetScale)>.001);}
   function frame(now){
     if(destroyed||!visible)return;
-    const elapsed=operation?now-operation.started:0;
-    const waitAnimated=waiting(operation)&&(
-      operation.phase==='committed'||(!prefs.reduceMotion&&(operation.phase!=='save-failed'||elapsed<COLLECT_MS))
-    );
+    const waitAnimated=[...operations.values()].some(op=>waiting(op)&&(
+      op.phase==='committed'||(!prefs.reduceMotion&&(!['save-failed','queued'].includes(op.phase)||now-op.started<COLLECT_MS))
+    ));
     // 静态待保存卡背可停留很久；减少动态效果时也不为不变的等待画面整屏重绘。
-    const animated=(!prefs.reduceMotion&&['sea','hearth','starfire','firefly','dawn'].includes(prefs.skinId))||waitAnimated||discovery||floats.length||movingNodes();
+    const animated=(!prefs.reduceMotion&&['sea','hearth','starfire','firefly','dawn'].includes(prefs.skinId))||waitAnimated||discovery||discoveryQueue.length||floats.length||movingNodes();
     // 每次屏幕刷新都可响应输入；按时间换算缓动，不用120Hz门槛丢掉高刷的隔帧。
     // 时钟在静止时也前进，避免长按后松手把整段静止时间算进回落的第一帧。
     const dt=lastFrame?Math.min(64,now-lastFrame):1000/60;lastFrame=now;
@@ -250,9 +275,11 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
   return {
     update(state){
       save=state.save;busy=state.busy||false;enabled=state.enabled!==false;selectedIds=state.selectedIds||[];prefs=save?.preferences||{};
+      canCombine=state.canCombine??(!busy&&![...operations.values()].some(waiting));
+      cardIndex=new Map((save?.cards||[]).map(card=>[card.id,card]));
       if(save&&revision!==`${save.id}:${state.saveEpoch||0}:${save.revision}`){
         revision=`${save.id}:${state.saveEpoch||0}:${save.revision}`;const known=new Set(save.cards.map(c=>c.id)),sig=JSON.stringify(save.layout||[]),newSave=saveId!==save.id||saveEpoch!==(state.saveEpoch||0);
-        if(newSave){operation=null;prepared=null;discovery=null;floats=[];pointers.clear();drag=null;pinch=null;hoverId=null;clearTimeout(zoomTimer);ownLayouts.clear();layoutSignature=null;modAudio.clear();modImages.clear();setPresentationBusy(false);pan={x:0,y:0};}
+        if(newSave){operations.clear();prepared=null;discovery=null;discoveryQueue=[];floats=[];pointers.clear();drag=null;pinch=null;hoverId=null;clearTimeout(zoomTimer);ownLayouts.clear();layoutSignature=null;modAudio.clear();modImages.clear();setPresentationBusy(false);pan={x:0,y:0};}
         // 偏好/统计写入不能重置抓取和动效；本窗口布局的响应也不覆盖更晚的摆放。
         if(sig!==layoutSignature||newSave){
           if(newSave||!ownLayouts.has(sig)){
@@ -265,14 +292,21 @@ export function createFactoryCanvas(canvas, handlers = {}, { now: clock = () => 
         else if(lastPrefZoom!==prefs.zoom){viewTouched=true;zoom=clamp(Number(prefs.zoom)||1,.45,1.65);}
         saveId=save.id;saveEpoch=state.saveEpoch||0;lastPrefZoom=prefs.zoom;
       }
-      if(!save){nodes=[];revision=null;operation=null;prepared=null;discovery=null;floats=[];setPresentationBusy(false);}
-      const next=state.synthesis;
-      if(next){
-        if(operation?.id!==next.id)beginOperation(next);
-        else Object.assign(operation,{phase:next.phase,source:next.source});
-        if(['failed','cancelled'].includes(next.phase)&&!operation.restored)restoreOperation();
-        if(state.lastResult?.operationId===next.id&&next.phase==='committed')operation.result=state.lastResult;
-      }else if(operation){operation=null;prepared=null;discovery=null;setPresentationBusy(false);}
+      if(!save){nodes=[];revision=null;operations.clear();prepared=null;discovery=null;discoveryQueue=[];floats=[];setPresentationBusy(false);}
+      const nextOperations=Array.isArray(state.syntheses)?state.syntheses:state.synthesis?[state.synthesis]:[];
+      const nextIds=new Set(nextOperations.map(op=>op.id));
+      for(const next of nextOperations){
+        if(!operations.has(next.id))beginOperation(next);
+        const op=operations.get(next.id);
+        Object.assign(op,{phase:next.phase,source:next.source});
+        if(next.result&&next.phase==='committed')op.result=next.result;
+        else if(state.lastResult?.operationId===next.id&&next.phase==='committed')op.result=state.lastResult;
+        if(['failed','cancelled'].includes(next.phase)&&!op.restored)restoreOperation(op);
+      }
+      for(const [id,op] of operations)if(!nextIds.has(id)&&(op.revealed||!waiting(op)))operations.delete(id);
+      if(!nextOperations.length&&!operations.size)prepared=null;
+      syncPresentationBusy();
+      if(state.canCombine===undefined)canCombine=!busy&&![...operations.values()].some(waiting);
       dirty=true;
     },
     prepareSynthesis,

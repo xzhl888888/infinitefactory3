@@ -9,7 +9,7 @@ import { createLibrary } from '../platforms/windows/library.mjs';
 import { createService } from '../platforms/windows/service.mjs';
 import { createNewSave, commitSynthesis } from '../src/core/model.js';
 
-const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'wxgc3-windows-library-tests');
+const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'infinitefactory3-tests');
 fs.mkdirSync(ROOT, { recursive: true });
 const TIME = '2026-10-27T07:00:00.000Z';
 const CONFIG = { baseUrl: 'https://fixture.invalid', model: 'fixture', key: 'synthetic-library-credential' };
@@ -29,6 +29,34 @@ function harness(t, overrides = {}) {
   return { library, dataDir, settings, get requests() { return requests; }, setFetch(next) { fetcher = next; } };
 }
 function initialize(h) { const status = h.library.status(); assert.equal(status.activeSlotId, 'legacy'); return h.library.initialize(fresh(), 'legacy'); }
+
+test('档案层允许并行生成与分项提交，仍在途的请求可单独取消且不能切档', async t => {
+  const h = harness(t); initialize(h);
+  const created = h.library.createSlot({ slotId: 'legacy', name: '另一个世界', save: fresh('save:parallel-other') });
+  const other = created.library.activeSlotId;
+  h.library.switchSlot({ slotId: other, id: 'legacy' });
+  await h.library.configure(CONFIG, 'legacy');
+  const network = [], entered = deferred();
+  h.setFetch(() => { const gate = deferred(); network.push(gate); if (network.length === 2) entered.resolve(); return gate.promise; });
+  const first = h.library.generate({ slotId: 'legacy', ingredientIds: IDS, operationId: 'library:first' });
+  const second = h.library.generate({ slotId: 'legacy', ingredientIds: ['base:metal', 'base:wood'], operationId: 'library:second' });
+  const cancelled = assert.rejects(second, { code: 'CANCELLED' });
+  await entered.promise;
+  network[0].resolve(response()); await first;
+  const original = h.library.loadPending('legacy', 'library:first');
+  const updated = h.library.updatePending({ slotId: 'legacy', operationId: original.operationId, result: original.result, source: original.source, modStates: [] });
+  assert.equal(updated.modProcessed, true, '另一项仍在请求时也能完成本项处理');
+  const current = h.library.load('legacy');
+  h.library.save(commitSynthesis(current, updated).save, current.revision, 'legacy');
+  assert.deepEqual(h.library.listPending('legacy'), []);
+  assert.throws(() => h.library.switchSlot({ slotId: 'legacy', id: other }), { code: 'BUSY' });
+  h.library.cancel('legacy', 'library:second');
+  network[1].resolve(response()); await cancelled;
+  assert.deepEqual(h.library.listPending('legacy'), []);
+  assert.equal(h.library.load('legacy').stats.synthesisCount, 1);
+  assert.equal(h.library.switchSlot({ slotId: 'legacy', id: other }).save.stats.synthesisCount, 0);
+  assert.equal(h.requests, 3, '一项检测和两项合成');
+});
 
 test('legacy 原路径接管，登记和读取不重写旧快照，API密文原样共享', async t => {
   const dataDir = fs.mkdtempSync(path.join(ROOT, 'legacy-'));

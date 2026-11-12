@@ -9,8 +9,8 @@ import { createController } from '../src/controller.js';
 import { createNewSave, validateSave } from '../src/core/model.js';
 
 // 只用独立临时档和内存假响应。真实 SQLite / bridge / controller 保留，
-// 测试控制异步响应顺序，验证开放台面操作不会覆盖合成或清掉待存答案。
-const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'wxgc3-feel-save-tests');
+// 闸门只控制异步响应先后，验证开放台面操作不会覆盖合成或清掉待存答案。
+const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'infinitefactory3-tests');
 const IDS = ['base:metal', 'base:wood'];
 const CARD = { name: '工具', emoji: '🛠️', category: '科技', description: '让双手更有办法。' };
 const CONFIG = { baseUrl: 'https://fixture.invalid/v1', model: 'fixture', key: 'synthetic-test-credential-only' };
@@ -38,7 +38,8 @@ async function harness(t) {
       case 'initialize_save': return library.initialize(args.save, args.slotId);
       case 'config_status': return library.configStatus(args.slotId);
       case 'configure_ai': return library.configure(args.config, args.slotId);
-      case 'load_pending': return library.loadPending(args.slotId);
+      case 'load_pending': return library.loadPending(args.slotId,args.operationId);
+      case 'list_pending': return library.listPending(args.slotId);
       case 'recovery_status': return library.recoveryStatus(args.slotId);
       case 'save_snapshot':
         calls.saves.push({ slotId: args.slotId, save: copy(args.save) });
@@ -52,7 +53,7 @@ async function harness(t) {
           return result;
         } catch (error) { if (afterGenerateError) await afterGenerateError(args); throw error; }
       }
-      case 'cancel_request': return library.cancel(args.slotId);
+      case 'cancel_request': return library.cancel(args.slotId,args.operationId);
       case 'create_slot': return library.createSlot(args);
       case 'switch_slot': return library.switchSlot(args);
       default: assert.fail('未覆盖命令：' + command);
@@ -74,7 +75,7 @@ async function harness(t) {
   };
 }
 
-test('等待 AI 时取卡、拖动与缩放写入后，合成仍保留最新台面且仅请求一次', async t => {
+test('等待 AI 时取卡、拖动与缩放写入后，两组合成各请求一次并保留最新台面', async t => {
   const h = await harness(t), entered = deferred(), answer = deferred();
   h.setFetcher(async () => { entered.resolve(); await answer.promise; return response(); });
   const combining = h.callbacks.onCombine(IDS);
@@ -82,17 +83,17 @@ test('等待 AI 时取卡、拖动与缩放写入后，合成仍保留最新台�
   const moved = [...copy(ORIGINAL).map(item => item.cardId === 'base:water' ? { ...item, x: 210, y: 80 } : item), node('table:fire', 'base:fire', 310)];
   await h.callbacks.onSaveLayout(moved);
   await h.callbacks.onSavePreferences({ zoom: 1.2 });
-  await h.callbacks.onCombine(['base:water', 'base:fire']);
-  assert.equal(h.calls.generates, 1, '无关操作开放不等于开放第二次合成');
+  const second = h.callbacks.onCombine(['base:water', 'base:fire']);
+  assert.equal(h.calls.generates, 2, '两个不同组合各有自己的请求');
   assert.deepEqual(h.disk().layout, moved);
   assert.equal(h.disk().stats.synthesisCount, 0);
-  answer.resolve(); await combining;
+  answer.resolve(); await Promise.all([combining, second]);
   assert.equal(h.controller.state.error, '');
   assert.deepEqual(h.disk().layout, moved);
   assert.equal(h.disk().preferences.zoom, 1.2);
-  assert.equal(h.disk().stats.synthesisCount, 1);
-  assert.equal(h.disk().recipes.length, 1);
-  assert.equal(h.calls.requests, 2, '一次配置夹具请求加一次合成夹具请求');
+  assert.equal(h.disk().stats.synthesisCount, 2);
+  assert.equal(h.disk().recipes.length, 2);
+  assert.equal(h.calls.requests, 3, '一次配置检测加两个组合的生成');
 });
 
 test('答案已进原生待存日志但响应尚未到达时，普通布局写入保留原答案', async t => {

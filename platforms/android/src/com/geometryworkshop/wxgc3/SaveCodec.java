@@ -139,7 +139,13 @@ final class SaveCodec {
         }
         JSONObject op=additions.get(0),fp=parse(str(op.opt("fingerprint")));String key=recipeKey(fp.opt("ingredientIds"));
         if(pending==null){JSONObject known=oldRecipes.get(key);Fault.require(known!=null&&newCards.size()==oldCards.size()&&newRecipes.size()==oldRecipes.size()&&known.opt("resultId").equals(op.opt("resultId")),"RESULT_REQUIRED");if(!fp.isNull("result"))Fault.require(same(card(fp.opt("result")),card(oldCards.get(known.opt("resultId")))),"OPERATION_CONFLICT");Fault.require(same(current.opt("mods"),next.opt("mods"))&&same(op.opt("source"),record("kind","recipe")),"OPERATION_CONFLICT");return false;}
-        Fault.require(!pending.has("modProcessed")||Boolean.TRUE.equals(pending.opt("modProcessed")),"PENDING_MOD_PROCESSING");
+        // 没有启用 Mod 时，前端直接保存 AI 原答案；有启用项时仍须先持久化 Mod 处理结果。
+        JSONArray installedMods = arr(current.opt("mods"),16);
+        for (int i = 0; i < installedMods.length(); i++) {
+            if (Boolean.TRUE.equals(obj(installedMods.opt(i)).opt("enabled"))) {
+                Fault.require(!pending.has("modProcessed") || Boolean.TRUE.equals(pending.opt("modProcessed")), "PENDING_MOD_PROCESSING");
+            }
+        }
         Fault.require(pending.opt("saveId").equals(current.opt("id"))&&pending.opt("operationId").equals(op.opt("id"))&&key.equals(recipeKey(pending.opt("ingredientIds")))&&same(card(pending.opt("result")),card(fp.opt("result"))),"OPERATION_CONFLICT");
         String at=stamp(pending.opt("now"));if(at.compareTo(str(current.opt("updatedAt")))<0)at=str(current.opt("updatedAt"));Fault.require(at.equals(op.opt("completedAt")),"OPERATION_CONFLICT");
         JSONArray currentMods=arr(current.opt("mods"),16),changes=modCodec.states(pending.opt("modStates"),currentMods),expectedMods=parse(record("mods",currentMods).toString()).optJSONArray("mods");

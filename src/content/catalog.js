@@ -1,3 +1,4 @@
+export const GAME_VERSION = '0.2.5';
 // 内容定义不包含配方；新档只从这五张本源开始。
 export const FORMAT_VERSION = 2;
 export const CONTENT_VERSION = 1;

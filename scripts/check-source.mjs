@@ -1,3 +1,4 @@
+import { GAME_VERSION } from '../src/content/catalog.js';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -18,14 +19,17 @@ for (const file of files.filter(f => /\.(c?m?js)$/.test(f))) {
   const result = spawnSync(process.execPath, ['--check', path.join(root, file)], { encoding: 'utf8', windowsHide: true });
   if (result.status !== 0) throw Error(`语法检查失败：${file}\n${result.stderr}`);
   const source = await readFile(path.join(root, file), 'utf8');
+  // 旧名称只是本地门面，不允许将旧传输或动态执行带回复用场景。
+  if (file.startsWith('src/legacy/') && /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|eval)\s*\(|new\s+Function\s*\(/.test(source)) throw Error('场景含不允许的网络或动态执行入口：'+file);
+
   for (const match of source.matchAll(/(?:from\s*|import\s*\()(['"])(\.[^'"\n]+)\1/g)) {
     // ES 模块测试可用 query 隔离缓存；文件存在性只检查 URL 的实际路径。
     const resolved = fileURLToPath(new URL(match[2], pathToFileURL(path.join(root, file))));
     if (!resolved.startsWith(root + path.sep) || !(await stat(resolved)).isFile()) throw Error(`引用不可用：${file}`);
   }
-  if (file.startsWith('src/') && /ADMIN_KEY|PRIVATE KEY|sk-proj-[A-Za-z0-9_-]{12,}/i.test(source)) {
+  if (file.startsWith('src/') && (/ADMIN_KEY|PRIVATE KEY|sk-proj-[A-Za-z0-9_-]{12,}/i.test(source) || !file.startsWith('src/legacy/') && /wxgc2|无限工厂2|TapTap|taptap|postgres|redis/i.test(source))) {
     // 只输出文件位置，不把潜在敏感内容复制进日志。
-    throw Error(`源码中发现疑似凭据，请检查：${file}`);
+    throw Error(`发现旧服务依赖或敏感标记，请检查：${file}`);
   }
 }
 const manifest = JSON.parse(await readFile(path.join(root, '.build/web/build-manifest.json'), 'utf8'));
@@ -45,7 +49,8 @@ async function inspectBuild(folder = '') {
   }
 }
 await inspectBuild();
-const config = JSON.parse(await readFile(path.join(root, 'electron-builder.json'), 'utf8'));
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-if (manifest.version !== pkg.version || config.productName !== '无限工厂3') throw Error('应用名称或版本不一致');
+const windows = JSON.parse(await readFile(path.join(root, 'electron-builder.json'), 'utf8'));
+const android = await readFile(path.join(root, 'platforms/android/AndroidManifest.xml'), 'utf8');
+if (GAME_VERSION !== pkg.version || windows.productName !== '无限工厂3' || !android.includes('android:versionName="'+pkg.version+'"')) throw Error('应用名称或版本不一致');
 console.log(`源码检查通过：${files.length} 个源文件；${manifest.files.length} 个前端文件与打包清单一致。`);

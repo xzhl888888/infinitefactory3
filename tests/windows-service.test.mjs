@@ -10,7 +10,7 @@ import { createService, normalizeConfig } from '../platforms/windows/service.mjs
 import { createNewSave, commitSynthesis, serializeSave, installMod, toggleMod, applyModAction } from '../src/core/model.js';
 import { buildSystemPrompt } from '../src/ai/prompt.js';
 
-const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'wxgc3-windows-service-tests');
+const ROOT = process.env.WXGC3_TEST_DIR || path.join(tmpdir(), 'infinitefactory3-tests');
 fs.mkdirSync(ROOT, { recursive: true });
 const TIME = '2026-10-27T05:00:00.000Z';
 const IDS = ['base:fire', 'base:water'];
@@ -174,7 +174,7 @@ test('篡改待存结果指纹不能清除真实答案', async t => {
 test('普通布局保存不能删除已发现卡牌、配方和操作历史', t => {
   const h = harness(t), old = h.service.initialize(fresh());
   const combined = commitSynthesis(old, { operationId: 'op:history', ingredientIds: IDS, result: CARD, now: TIME }).save;
-  h.service.save(combined, 0);
+  h.service.importSave(combined);
   assert.throws(() => h.service.save({ ...old, revision: 2 }, 1), { code: 'INVALID_SAVE' });
   assert.equal(h.service.load().stats.synthesisCount, 1);
 });
@@ -219,7 +219,7 @@ test('取消后迟到的成功响应不写 pending，新请求可正常完成', 
   const slow = deferred(); h.setFetch(() => slow.promise);
   const first = h.service.generate({ ingredientIds: IDS, operationId: 'op:cancelled' });
   const rejected = assert.rejects(first, { code: 'CANCELLED' });
-  await assert.rejects(h.service.generate({ ingredientIds: IDS, operationId: 'op:busy' }), { code: 'BUSY' });
+  await assert.rejects(h.service.generate({ ingredientIds: IDS, operationId: 'op:busy' }), { code: 'SYNTHESIS_ALREADY_RUNNING' });
   h.service.cancel(); h.setFetch(() => response());
   await h.service.generate({ ingredientIds: IDS, operationId: 'op:new' });
   slow.resolve(response()); await rejected;
@@ -345,7 +345,8 @@ test('AI主题仅进入材料数据，变换更新pending失败保留原答案',
   assert.deepEqual(user.worldThemes, [MOD.theme]); assert.equal(h.calls[1].url, `${CONFIG.baseUrl}/chat/completions`);
   const original = h.service.loadPending();
   assert.equal(original.modProcessed, false);
-  assert.throws(() => h.service.updatePending({ operationId: 'op:wrong', result: CARD }), { code: 'OPERATION_CONFLICT' });
+  assert.throws(() => h.service.save(commitPending(h.service), h.service.load().revision), { code: 'PENDING_MOD_PROCESSING' });
+  assert.throws(() => h.service.updatePending({ operationId: 'op:wrong', result: CARD }), { code: 'PENDING_NOT_FOUND' });
   assert.throws(() => h.service.updatePending({ operationId: original.operationId, result: CARD, modStates: [{ id: 'not-installed', state: {} }] }));
   assert.deepEqual(h.service.loadPending(), original);
   const transformed = h.service.updatePending({ operationId: original.operationId, result: { ...CARD, name: '海雾' }, source: { kind: 'ai' }, modStates: [{ id: MOD.id, state: { transformed: true } }] });
@@ -359,7 +360,7 @@ test('AI主题仅进入材料数据，变换更新pending失败保留原答案',
 test('缓存配方可携带Mod afterCombine状态落盘，不再次请求AI', t => {
   const h = harness(t); h.service.initialize(fresh()); installEnabled(h.service);
   const old = h.service.load(), first = commitSynthesis(old, { operationId: 'op:first-mod', ingredientIds: IDS, result: CARD, now: TIME }).save;
-  h.service.save(first, old.revision);
+  h.service.importSave(first);
   const args = { operationId: 'op:cached-mod', ingredientIds: IDS, result: CARD, source: { kind: 'recipe' }, modStates: [{ id: MOD.id, state: { repeats: 1 } }] };
   assert.throws(() => h.service.stageModResult({ ...args, result: { ...CARD, name: '不能改已知配方' } }), { code: 'OPERATION_CONFLICT' });
   const pending = h.service.stageModResult(args), current = h.service.load();
@@ -371,8 +372,121 @@ test('缓存配方可携带Mod afterCombine状态落盘，不再次请求AI', t 
 test('旧五字段journal默认尚未处理Mod，非法处理标记不能冒充完成', t => {
   const h = harness(t); h.service.initialize(fresh());
   const legacy = { saveId: 'save:fixture', operationId: 'op:legacy', ingredientIds: IDS, result: CARD, now: TIME };
-  const db = rawDatabase(h.dataDir); db.prepare('INSERT INTO pending VALUES(1,?)').run(JSON.stringify(legacy));
+  const db = rawDatabase(h.dataDir); db.prepare('INSERT INTO pending VALUES(?,?)').run(legacy.operationId, JSON.stringify(legacy));
   assert.equal(h.service.loadPending().modProcessed, false);
   db.prepare('UPDATE pending SET document=?').run(JSON.stringify({ ...legacy, modProcessed: 'true' }));
   assert.throws(() => h.service.loadPending(), { code: 'STORAGE_CORRUPT' }); db.close();
+});
+
+test('四路未知配方乱序完成，布局可保存，分项提交和重开不会覆盖其他待存答案', async t => {
+  const h = harness(t); h.service.initialize(fresh()); await h.service.configure(CONFIG);
+  const combinations = [IDS, ['base:metal', 'base:wood'], ['base:earth', 'base:water'], ['base:fire', 'base:wood']];
+  const network = [], entered = deferred();
+  h.setFetch(() => {
+    const gate = deferred(); network.push(gate);
+    if (network.length === 4) entered.resolve();
+    return gate.promise;
+  });
+  const operations = combinations.map((ingredientIds, i) => h.service.generate({ ingredientIds, operationId: `parallel:${i}` }));
+  const repeated = h.service.generate({ ingredientIds: [...IDS].reverse(), operationId: 'parallel:0' });
+  await entered.promise;
+  await assert.rejects(h.service.generate({ ingredientIds: IDS, operationId: 'parallel:duplicate' }), { code: 'SYNTHESIS_ALREADY_RUNNING' });
+  await assert.rejects(h.service.generate({ ingredientIds: ['base:metal', 'base:earth'], operationId: 'parallel:overflow' }), { code: 'SYNTHESIS_LIMIT' });
+  await assert.rejects(h.service.configure(CONFIG), { code: 'BUSY' });
+  const beforeLayout = h.service.load();
+  h.service.save({ ...beforeLayout, revision: 1, layout: [{ id: 'table:kept', cardId: 'base:metal', x: 23, y: 17, pinned: false }] }, 0);
+  assert.equal(h.service.load().layout[0].x, 23);
+  for (const i of [2, 0, 3, 1]) {
+    network[i].resolve(response({ ...CARD, name: `新卡${i}` }));
+    await operations[i];
+  }
+  assert.deepEqual(await repeated, { ...CARD, name: '新卡0' });
+  assert.equal(h.calls.length, 5, '一次配置检测，四次独立生成，重复操作没有第二次收费');
+  assert.deepEqual(h.service.listPending().map(item => item.operationId), ['parallel:2', 'parallel:0', 'parallel:3', 'parallel:1']);
+  assert.equal(h.service.loadPending('parallel:1').result.name, '新卡1');
+  const current = h.service.load(), selected = h.service.loadPending('parallel:1');
+  h.service.save(commitSynthesis(current, selected).save, current.revision);
+  assert.equal(h.service.loadPending('parallel:1'), null);
+  assert.equal(h.service.listPending().length, 3);
+  h.service.close();
+  const reopened = createService(h.settings); t.after(() => reopened.close());
+  assert.equal(reopened.listPending().length, 3);
+  for (const item of reopened.listPending()) {
+    const previous = reopened.load();
+    reopened.save(commitSynthesis(previous, item).save, previous.revision);
+  }
+  assert.equal(reopened.load().stats.synthesisCount, 4);
+  assert.equal(reopened.load().cards.length, 9);
+  assert.equal(reopened.load().recipes.length, 4);
+  assert.equal(reopened.load().layout[0].x, 23);
+  assert.deepEqual(reopened.listPending(), []);
+  assert.equal(h.calls.length, 5, '重开续存不重新调用模型');
+});
+
+test('只取消指定生成，另一个请求仍能完成并落盘', async t => {
+  const h = harness(t); h.service.initialize(fresh()); await h.service.configure(CONFIG);
+  const network = [], entered = deferred();
+  h.setFetch(() => { const gate = deferred(); network.push(gate); if (network.length === 2) entered.resolve(); return gate.promise; });
+  const first = h.service.generate({ ingredientIds: IDS, operationId: 'cancel:first' });
+  const cancelled = assert.rejects(first, { code: 'CANCELLED' });
+  const second = h.service.generate({ ingredientIds: ['base:wood', 'base:earth'], operationId: 'cancel:second' });
+  await entered.promise;
+  h.service.cancel('cancel:first');
+  network[0].resolve(response({ ...CARD, name: '取消的答案' }));
+  network[1].resolve(response({ ...CARD, name: '仍然完成' }));
+  await cancelled; await second;
+  assert.equal(h.service.loadPending('cancel:first'), null);
+  assert.equal(h.service.loadPending('cancel:second').result.name, '仍然完成');
+  assert.equal(h.service.listPending().length, 1);
+  assert.equal(h.calls.length, 3);
+});
+
+function downgradePendingFixture(h) {
+  h.service.close();
+  const db = rawDatabase(h.dataDir);
+  const save = db.prepare('SELECT document FROM current_save').get().document;
+  const pending = db.prepare('SELECT document FROM pending').get()?.document ?? null;
+  db.exec('BEGIN IMMEDIATE; ALTER TABLE pending RENAME TO pending_v2; CREATE TABLE pending(singleton INTEGER PRIMARY KEY CHECK(singleton=1),document TEXT NOT NULL)');
+  if (pending) db.prepare('INSERT INTO pending VALUES(1,?)').run(pending);
+  db.exec('DROP TABLE pending_v2; PRAGMA user_version=1; COMMIT'); db.close();
+  return { save, pending };
+}
+
+test('旧单项待存表迁移前保留原文，升级后仍能接着保存同一答案', async t => {
+  const h = harness(t); h.service.initialize(fresh()); await h.service.configure(CONFIG);
+  await h.service.generate({ ingredientIds: IDS, operationId: 'migration:kept' });
+  const original = downgradePendingFixture(h);
+  const reopened = createService(h.settings); t.after(() => reopened.close());
+  const item = reopened.loadPending(); assert.equal(item.operationId, 'migration:kept');
+  const backup = JSON.parse(fs.readFileSync(path.join(h.dataDir, 'migration-pending-v1.json'), 'utf8'));
+  assert.deepEqual(backup, { databaseVersion: 1, ...original });
+  const db = rawDatabase(h.dataDir);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(db.prepare('SELECT document FROM current_save').get().document, original.save); db.close();
+  const current = reopened.load(); reopened.save(commitSynthesis(current, item).save, current.revision);
+  assert.equal(reopened.load().stats.synthesisCount, 1); assert.deepEqual(reopened.listPending(), []);
+  assert.equal(h.calls.length, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h.dataDir, 'migration-pending-v1.json'), 'utf8')), backup);
+});
+
+test('旧待存迁移备份失败时原表和原数据完整保留', async t => {
+  const h = harness(t); h.service.initialize(fresh()); await h.service.configure(CONFIG);
+  await h.service.generate({ ingredientIds: IDS, operationId: 'migration:blocked' });
+  const original = downgradePendingFixture(h);
+  fs.mkdirSync(path.join(h.dataDir, 'migration-pending-v1.json'));
+  const reopened = createService(h.settings); t.after(() => reopened.close());
+  assert.throws(() => reopened.load(), { code: 'MIGRATION_BACKUP_FAILED' });
+  const db = rawDatabase(h.dataDir);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(db.prepare('SELECT document FROM pending WHERE singleton=1').get().document, original.pending);
+  assert.equal(db.prepare('SELECT document FROM current_save').get().document, original.save); db.close();
+});
+
+test('未知操作缺少自己的待存答案时拒绝快照，其他答案和统计保留', async t => {
+  const h = harness(t); h.service.initialize(fresh()); await h.service.configure(CONFIG);
+  await h.service.generate({ ingredientIds: IDS, operationId: 'guard:real' });
+  const current = h.service.load(), original = h.service.loadPending('guard:real');
+  const forged = commitSynthesis(current, { operationId: 'guard:forged', ingredientIds: IDS, result: CARD, now: TIME }).save;
+  assert.throws(() => h.service.save(forged, current.revision), { code: 'RESULT_REQUIRED' });
+  assert.deepEqual(h.service.load(), current); assert.deepEqual(h.service.loadPending('guard:real'), original);
 });

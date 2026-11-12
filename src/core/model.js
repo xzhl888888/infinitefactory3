@@ -203,7 +203,7 @@ export function commitSynthesis(save, { operationId, ingredientIds, result, now,
     mods: current.mods.map(mod => ({ ...mod, state: stateChanges.find(v=>v.id===mod.manifest.id)?.state ?? mod.state })),
     operations: [...current.operations, { id: opId, recipeKey: key, resultId: card.id, completedAt: at, fingerprint: inputFingerprint, source: checkedSource }],
   };
-  // 返回新的存档快照，调用方在事务提交后显示结果。
+  // 只产出候选快照；调用方仍须成功原子落盘，才可以展示合成已完成。
   return { save: validateSave(next), card, recipe, isNewCard, isNewRecipe, alreadyCommitted: false };
 }
 

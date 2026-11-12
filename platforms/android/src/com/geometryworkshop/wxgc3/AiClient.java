@@ -16,9 +16,10 @@ final class AiClient {
     private final ScheduledExecutorService deadlines=Executors.newSingleThreadScheduledExecutor();
     static final class Request {
         volatile boolean cancelled,timedOut;
+        volatile boolean preserveResult,responseReady;
         volatile HttpsURLConnection connection;
-        void cancel(){cancelled=true;HttpsURLConnection c=connection;if(c!=null)c.disconnect();}
-        void check(){if(timedOut)throw new Fault("REQUEST_TIMEOUT");if(cancelled)throw new Fault("CANCELLED");}
+        void cancel(){cancelled=true;HttpsURLConnection c=connection;if(c!=null&&!responseReady)c.disconnect();}
+        void check(){if(preserveResult&&responseReady)return;if(timedOut)throw new Fault("REQUEST_TIMEOUT");if(cancelled)throw new Fault("CANCELLED");}
     }
     AiClient(SaveCodec codec){this.codec=codec;}
     static JSONObject normalizeConfig(JSONObject raw){
@@ -48,19 +49,25 @@ final class AiClient {
         JSONObject body=SaveCodec.record("model",clean.opt("model"),"messages",messages(materials,themes,customPrompt),"stream",false,"max_tokens",1024,"response_format",SaveCodec.record("type","json_object"));
         try{if("api.deepseek.com".equals(new URI(SaveCodec.str(clean.opt("baseUrl"))).getHost()))SaveCodec.put(body,"thinking",SaveCodec.record("type","disabled"));}catch(Exception e){throw new Fault("INVALID_CONFIG");}
         byte[] bytes=body.toString().getBytes(StandardCharsets.UTF_8);Fault.require(bytes.length<=128*1024,"INVALID_CONFIG");
-        ScheduledFuture<?> deadline=deadlines.schedule(()->{request.timedOut=true;HttpsURLConnection c=request.connection;if(c!=null)c.disconnect();},60,TimeUnit.SECONDS);
+        ScheduledFuture<?> deadline=deadlines.schedule(()->{request.timedOut=true;HttpsURLConnection c=request.connection;if(c!=null)c.disconnect();},180,TimeUnit.SECONDS);
         HttpsURLConnection connection=null;
+        boolean reusable=false;
         try{
             connection=(HttpsURLConnection)new URI(SaveCodec.str(clean.opt("baseUrl"))+"/chat/completions").toURL().openConnection();request.connection=connection;request.check();
-            connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(15000);connection.setReadTimeout(60000);connection.setRequestMethod("POST");connection.setDoOutput(true);connection.setUseCaches(false);connection.setFixedLengthStreamingMode(bytes.length);
-            connection.setRequestProperty("Authorization","Bearer "+key);connection.setRequestProperty("Content-Type","application/json; charset=utf-8");connection.setRequestProperty("Accept","application/json");connection.setRequestProperty("Connection","close");
+            connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(15000);connection.setReadTimeout(180000);connection.setRequestMethod("POST");connection.setDoOutput(true);connection.setUseCaches(false);connection.setFixedLengthStreamingMode(bytes.length);
+            connection.setRequestProperty("Authorization","Bearer "+key);connection.setRequestProperty("Content-Type","application/json; charset=utf-8");connection.setRequestProperty("Accept","application/json");
             try(OutputStream out=connection.getOutputStream()){request.check();out.write(bytes);}int status=connection.getResponseCode();request.check();
             if(status<200||status>=300){String code=status>=300&&status<400?"REDIRECT_REJECTED":status==401||status==403?"AUTH_FAILED":status==402?"NO_BALANCE":status==404?"MODEL_NOT_FOUND":status==429?"RATE_LIMITED":status==408||status==504?"REQUEST_TIMEOUT":status>=500?"SERVER_ERROR":"REQUEST_FAILED";throw new Fault(code);}
-            long length=connection.getContentLengthLong();Fault.require(length<=1024*1024,"RESPONSE_TOO_LARGE");byte[] response;try(InputStream in=connection.getInputStream()){response=PrivateFiles.read(in,1024*1024,"RESPONSE_TOO_LARGE");}request.check();
+            long length=connection.getContentLengthLong();Fault.require(length<=1024*1024,"RESPONSE_TOO_LARGE");byte[] response;try(InputStream in=connection.getInputStream()){response=PrivateFiles.read(in,1024*1024,"RESPONSE_TOO_LARGE");}
+            if(!request.preserveResult)request.check();
             JSONObject result=parseResponse(new String(response,StandardCharsets.UTF_8));
             // 厂商响应也按不可信内容处理，不允许回显完整Key到页面或可分享卡牌。
-            rejectKeyEcho(result,key);return result;
-        }catch(Fault e){throw e;}catch(SocketTimeoutException e){throw new Fault("REQUEST_TIMEOUT");}catch(Exception e){request.check();throw new Fault("REQUEST_FAILED");}finally{deadline.cancel(false);request.connection=null;if(connection!=null)connection.disconnect();}
+            rejectKeyEcho(result,key);request.responseReady=true;reusable=true;return result;
+        }catch(Fault e){request.check();throw e;}catch(SocketTimeoutException e){request.check();throw new Fault("REQUEST_TIMEOUT");}catch(Exception e){request.check();throw new Fault("REQUEST_FAILED");}finally{
+            deadline.cancel(false);request.connection=null;
+            // 完整消费成功响应后把连接交还系统池；失败和取消仍立即断开。
+            if(connection!=null&&!reusable)connection.disconnect();
+        }
     }
     static void rejectKeyEcho(JSONObject result,String key){for(String field:new String[]{"name","emoji","category","description"})Fault.require(!SaveCodec.str(result.opt(field)).contains(key),"AI_SENSITIVE_RESPONSE");}
     JSONObject parseResponse(String text){

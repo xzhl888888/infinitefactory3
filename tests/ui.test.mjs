@@ -27,9 +27,9 @@ function harness({width=960,height=540,configured=true,initialSave=null,stayHome
   window.HTMLCanvasElement.prototype.releasePointerCapture=function(id){captures.get(this)?.delete(id);};
   const root=document.createElement('div');document.body.append(root);root.getBoundingClientRect=()=>({left:0,top:0,width,height});
   window.HTMLCanvasElement.prototype.getBoundingClientRect=()=>({left:0,top:0,width:633.6,height:540});
-  const calls={configure:[],combine:[],preferences:[],layouts:[],cancel:0,retry:0,export:0,import:0,backups:0,restores:[],refresh:0,create:[],switch:[],rename:[],chooseMod:0,installMod:[],toggleMod:[],removeMod:[],modAction:[]};
+  const calls={cancelIds:[],retryIds:[],configure:[],combine:[],preferences:[],layouts:[],cancel:0,retry:0,export:0,import:0,backups:0,restores:[],refresh:0,create:[],switch:[],rename:[],chooseMod:0,installMod:[],toggleMod:[],removeMod:[],modAction:[]};
   const save=initialSave||createNewSave({id:'ui-fixture',now:'2026-10-26T00:00:00.000Z'});
-  const view=createAppView(root,{onConfigure:value=>calls.configure.push(value),onCombine:ids=>calls.combine.push([...ids]),onSavePreferences:value=>calls.preferences.push(value),onSaveLayout:value=>calls.layouts.push(value),onCancel:()=>{calls.cancel++;},onRetrySave:()=>{calls.retry++;},onExport:()=>{calls.export++;},onImport:()=>{calls.import++;},onListBackups:()=>{calls.backups++;},onRestoreBackup:id=>calls.restores.push(id),onRefreshLibrary:()=>{calls.refresh++;},onCreateSlot:name=>calls.create.push(name),onSwitchSlot:id=>calls.switch.push(id),onRenameSlot:(id,name)=>calls.rename.push({id,name}),onChooseMod:()=>{calls.chooseMod++;},onInstallMod:replace=>calls.installMod.push(replace),onToggleMod:(id,enabled)=>calls.toggleMod.push({id,enabled}),onRemoveMod:id=>calls.removeMod.push(id),onModAction:(id,action)=>calls.modAction.push({id,action})});
+  const view=createAppView(root,{onConfigure:value=>calls.configure.push(value),onCombine:ids=>calls.combine.push([...ids]),onSavePreferences:value=>calls.preferences.push(value),onSaveLayout:value=>calls.layouts.push(value),onCancel:id=>{calls.cancel++;calls.cancelIds.push(id);},onRetrySave:id=>{calls.retry++;calls.retryIds.push(id);},onExport:()=>{calls.export++;},onImport:()=>{calls.import++;},onListBackups:()=>{calls.backups++;},onRestoreBackup:id=>calls.restores.push(id),onRefreshLibrary:()=>{calls.refresh++;},onCreateSlot:name=>calls.create.push(name),onSwitchSlot:id=>calls.switch.push(id),onRenameSlot:(id,name)=>calls.rename.push({id,name}),onChooseMod:()=>{calls.chooseMod++;},onInstallMod:replace=>calls.installMod.push(replace),onToggleMod:(id,enabled)=>calls.toggleMod.push({id,enabled}),onRemoveMod:id=>calls.removeMod.push(id),onModAction:(id,action)=>calls.modAction.push({id,action})});
   const state={save,configStatus:{configured,model:'fixture'},mode:'native',busy:false,error:'',lastResult:null,synthesis:null,canRetrySave:false};
   view.render(state);
   if(configured&&!stayHome)root.querySelector('.wx-home-enter').click();
@@ -239,7 +239,7 @@ test('画布拖叠合成不会清空已经放入合成台的材料',()=>{
   }finally{h.close();}
 });
 
-test('主页布局：无顶栏，右词典默认展开，收藏和合成台默认收起',()=>{
+test('旧版主结构：无顶栏，右词典默认展开，收藏和合成台默认收起',()=>{
   const h=harness();try{
     assert.equal(h.root.querySelector('.wx-header'),null);
     assert.equal(h.root.querySelector('.wx-dock').hidden,true);
@@ -454,4 +454,72 @@ test('本地模式允许已知配方，未知配方先配置且保留完整选�
     unknown.root.querySelector('.wx-api-close').click();assert.equal(unknown.root.querySelector('.wx-modal-layer').hidden,true);assert.deepEqual(slotNames(unknown),['水','火']);
     assert.equal(unknown.calls.configure.length,0,'不因查看本地卡牌或关配置框自动检测');
   }finally{unknown.close();}
+});
+
+
+test('并行任务各有取消和补存入口，等待期间能继续选择下一组材料',()=>{
+  const h=harness();try{
+    const first={id:'parallel-a',ingredientIds:['base:metal','base:wood'],source:'ai',phase:'requesting',startedAt:Date.now()};
+    const second={id:'parallel-b',ingredientIds:['base:water','base:fire'],source:'ai',phase:'save-failed',startedAt:Date.now()};
+    h.render({syntheses:[first],synthesis:first,busy:'combine',canCombine:true,activeSynthesisCount:1});
+    pick(h,'metal',1);pick(h,'wood',2);assert.equal(combineButton(h).disabled,false);
+    combineButton(h).click();assert.equal(h.calls.combine.length,0,'重复的在途组合应复用原任务');
+
+    h.render({syntheses:[first,second],synthesis:second,canCombine:false,canRetrySave:true});
+    const rows=[...h.root.querySelectorAll('.wx-synthesis-task')];assert.equal(rows.length,2);
+    assert.match(rows[0].textContent,/金 \+ 木/);assert.match(rows[1].textContent,/水 \+ 火/);
+    rows[0].querySelector('button').click();rows[1].querySelector('button').click();
+    assert.deepEqual(h.calls.cancelIds,['parallel-a']);assert.deepEqual(h.calls.retryIds,['parallel-b']);
+  }finally{h.close();}
+});
+
+test('较早并行任务失败时保留后来已选的材料',()=>{
+  const h=harness();try{
+    h.render({syntheses:[],canCombine:true});pick(h,'metal',1);pick(h,'wood',2);combineButton(h).click();
+    assert.deepEqual(h.calls.combine,[['base:metal','base:wood']]);
+    const first={id:'submitted-first',ingredientIds:['base:metal','base:wood'],source:'ai',phase:'requesting',startedAt:Date.now()};
+    h.render({syntheses:[first],synthesis:first,busy:'combine',canCombine:true});
+    pick(h,'water',3);pick(h,'fire',4);assert.deepEqual(slotNames(h),['水','火']);
+    h.render({syntheses:[{...first,phase:'failed'}],synthesis:{...first,phase:'failed'},busy:false,canCombine:true});
+    assert.deepEqual(slotNames(h),['水','火']);
+  }finally{h.close();}
+});
+
+test('首路在途时仍能从词典详情连续加入第二组材料并提交',()=>{
+  const h=harness();try{
+    const first={id:'first-via-detail',ingredientIds:['base:metal','base:wood'],source:'ai',phase:'requesting',startedAt:Date.now()};
+    h.render({syntheses:[first],synthesis:first,busy:'combine',canCombine:true,activeSynthesisCount:1});
+    for(const name of ['水','火']){
+      h.root.querySelector('.wx-dictionary .wx-card-tile[title="'+name+'"]').dispatchEvent(new h.window.MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
+      const add=h.root.querySelector('.wx-add-ingredient');assert.equal(add.disabled,false);add.click();
+      assert.equal(h.root.querySelector('.wx-panel-layer').hidden,true);
+    }
+    assert.deepEqual(slotNames(h),['水','火']);assert.equal(combineButton(h).disabled,false);combineButton(h).click();
+    assert.deepEqual(h.calls.combine,[['base:water','base:fire']]);
+  }finally{h.close();}
+});
+
+test('请求等待中可以从合成历史与配方表继续取已有卡到台面',()=>{
+  let save=createNewSave({id:'parallel-records',now:TEST_TIME});save=commitSynthesis(save,{operationId:'history-first',ingredientIds:['base:metal','base:metal'],result:TEST_RESULT,now:TEST_TIME}).save;
+  const h=harness({initialSave:save});try{
+    const first={id:'unrelated-ai',ingredientIds:['base:water','base:fire'],source:'ai',phase:'requesting',startedAt:Date.now()};
+    h.render({syntheses:[first],synthesis:first,busy:'combine',canCombine:true,activeSynthesisCount:1});
+    for(const entry of ['📜 合成历史','📋 配方表']){
+      clickText(h.root,'☰ 更多');clickText(h.root,entry);
+      const card=h.root.querySelector('.wx-record-row button[aria-label="工具，放回台面"]');assert.ok(card);assert.equal(card.disabled,false);
+      const count=h.calls.layouts.length;card.click();assert.equal(h.root.querySelector('.wx-panel-layer').hidden,true);assert.equal(h.calls.layouts.length,count+1);
+    }
+    assert.equal(h.calls.combine.length,0);
+  }finally{h.close();}
+});
+
+test('排队处理的已收答案显示等待保存，只有前项失败提供补存按钮',()=>{
+  const h=harness();try{
+    const first={id:'mod-save-failed',ingredientIds:['base:metal','base:wood'],source:'ai',phase:'save-failed'};
+    const second={id:'mod-queued',ingredientIds:['base:water','base:fire'],source:'ai',phase:'queued'};
+    h.render({syntheses:[first,second],synthesis:second,busy:false,canCombine:false,canRetrySave:true});
+    const rows=[...h.root.querySelectorAll('.wx-synthesis-task')];assert.equal(rows.length,2);
+    assert.match(rows[0].textContent,/结果待保存/);assert.equal(rows[0].querySelector('button').textContent,'重试保存');
+    assert.match(rows[1].textContent,/等待保存/);assert.equal(rows[1].querySelector('button'),null);assert.equal(rows[1].querySelector('.wx-task-elapsed'),null);
+  }finally{h.close();}
 });

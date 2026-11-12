@@ -10,15 +10,16 @@ import { BASE_CARDS, DEFAULT_AI_CONFIG } from '../../src/content/catalog.js';
 const APP_ID = 0x57464733;
 const RESPONSE_BYTES = 1024 * 1024;
 const CONFIG_BYTES = 8192;
+const MAX_SYNTHESIS_REQUESTS = 4;
 const SCHEMA = `
  CREATE TABLE current_save(singleton INTEGER PRIMARY KEY CHECK(singleton=1), save_id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL);
  CREATE TABLE cards(id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, document TEXT NOT NULL);
  CREATE INDEX cards_name ON cards(name COLLATE NOCASE);
  CREATE INDEX cards_category ON cards(category, name COLLATE NOCASE);
  CREATE TABLE recipes(recipe_key TEXT PRIMARY KEY, result_id TEXT NOT NULL REFERENCES cards(id), document TEXT NOT NULL);
- CREATE TABLE pending(singleton INTEGER PRIMARY KEY CHECK(singleton=1), document TEXT NOT NULL);
+ CREATE TABLE pending(operation_id TEXT PRIMARY KEY, document TEXT NOT NULL);
  CREATE TABLE backups(id TEXT PRIMARY KEY, document TEXT NOT NULL, created_at TEXT NOT NULL, reason TEXT NOT NULL);
- PRAGMA application_id=${APP_ID}; PRAGMA user_version=1;`;
+ PRAGMA application_id=${APP_ID}; PRAGMA user_version=2;`;
 const fail = code => { throw new DomainError(code); };
 const copy = value => structuredClone(value);
 const record = value => value && typeof value === 'object' && !Array.isArray(value);
@@ -105,14 +106,15 @@ async function boundedResponse(response) {
 }
 
 /** 仅供可信主进程使用。窗口只获得逐项 IPC 方法，不能传 SQL、路径或加密回调。 */
-export function createService({ dataDir, credentialDir = dataDir, requireExisting = false, encrypt, decrypt, fetchImpl = globalThis.fetch, timeoutMs = 60000 }) {
+export function createService({ dataDir, credentialDir = dataDir, requireExisting = false, encrypt, decrypt, fetchImpl = globalThis.fetch, timeoutMs = 180000 }) {
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) fail('STORAGE_ERROR');
   if (typeof credentialDir !== 'string' || !path.isAbsolute(credentialDir)) fail('STORAGE_ERROR');
   const databaseFile = path.join(dataDir, 'world.sqlite3');
   const recoveryDir = path.join(dataDir, 'recovery');
   const configFile = path.join(credentialDir, 'ai-config.encrypted');
   const markerFile = path.join(credentialDir, 'configured.marker');
-  let database = null, openError = null, active = null, backupWarning = false;
+  let database = null, openError = null, configuration = null, backupWarning = false;
+  const requests = new Map();
 
   function open(file = databaseFile) {
     const db = new DatabaseSync(file);
@@ -120,13 +122,51 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
       db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
       const version = db.prepare('PRAGMA user_version').get().user_version;
       const appId = db.prepare('PRAGMA application_id').get().application_id;
-      if (version !== 0 && version !== 1) fail('UNSUPPORTED_SAVE_VERSION');
-      if (version === 1 && appId !== APP_ID) fail('STORAGE_CORRUPT');
+      if (![0, 1, 2].includes(version)) fail('UNSUPPORTED_SAVE_VERSION');
+      if (version && appId !== APP_ID) fail('STORAGE_CORRUPT');
       if (version === 0 && db.prepare("SELECT count(*) n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get().n) fail('STORAGE_CORRUPT');
       db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       if (!version) { db.exec('BEGIN IMMEDIATE'); try { db.exec(SCHEMA); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } }
+      if (version === 1) migratePending(db);
       return db;
     } catch (error) { db.close(); throw error; }
+  }
+  function migratePending(connection) {
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      // 另一个窗口可能已完成迁移，取得写锁后再次核对版本。
+      if (connection.prepare('PRAGMA user_version').get().user_version === 2) {
+        connection.exec('COMMIT');
+        return;
+      }
+      const row = connection.prepare('SELECT save_id,revision,document FROM current_save WHERE singleton=1').get();
+      let current = null;
+      if (row) {
+        current = parseSave(row.document);
+        if (current.id !== row.save_id || current.revision !== row.revision) fail('STORAGE_CORRUPT');
+      }
+      const rows = connection.prepare('SELECT singleton,document FROM pending').all();
+      if (rows.length > 1 || rows.some(item => item.singleton !== 1)) fail('STORAGE_CORRUPT');
+      let pending = null;
+      if (rows.length) {
+        if (!current) fail('STORAGE_CORRUPT');
+        try { pending = cleanPending(JSON.parse(rows[0].document), current); }
+        catch { fail('STORAGE_CORRUPT'); }
+      }
+      const original = JSON.stringify({ databaseVersion: 1, save: row?.document ?? null, pending: rows[0]?.document ?? null });
+      const originalFile = path.join(dataDir, 'migration-pending-v1.json');
+      try {
+        if (fs.existsSync(originalFile)) {
+          if (readLimited(originalFile, SAVE_LIMITS.bytes * 3).toString('utf8') !== original) fail('MIGRATION_BACKUP_FAILED');
+        } else atomicWrite(originalFile, original);
+      } catch { fail('MIGRATION_BACKUP_FAILED'); }
+      connection.exec('ALTER TABLE pending RENAME TO pending_v1; CREATE TABLE pending(operation_id TEXT PRIMARY KEY, document TEXT NOT NULL)');
+      if (pending) connection.prepare('INSERT INTO pending VALUES(?,?)').run(pending.operationId, rows[0].document);
+      connection.exec('DROP TABLE pending_v1; PRAGMA user_version=2; COMMIT');
+    } catch (error) {
+      try { connection.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
   }
   try {
     fs.mkdirSync(dataDir, { recursive: true }); fs.mkdirSync(credentialDir, { recursive: true }); fs.mkdirSync(recoveryDir, { recursive: true });
@@ -206,10 +246,24 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
     commitSynthesis(current, clean);
     return clean;
   }
-  function pendingFor(current, connection = db()) {
-    const row = connection.prepare('SELECT document FROM pending WHERE singleton=1').get();
-    if (!row) return null;
-    try { return cleanPending(JSON.parse(row.document), current); } catch { fail('STORAGE_CORRUPT'); }
+  function pendingItems(current, connection = db()) {
+    const rows = connection.prepare('SELECT operation_id,document FROM pending ORDER BY rowid LIMIT 5').all();
+    if (rows.length > MAX_SYNTHESIS_REQUESTS) fail('STORAGE_CORRUPT');
+    try {
+      return rows.map(row => {
+        const pending = cleanPending(JSON.parse(row.document), current);
+        if (pending.operationId !== row.operation_id) fail('STORAGE_CORRUPT');
+        return pending;
+      });
+    } catch { fail('STORAGE_CORRUPT'); }
+  }
+  function pendingFor(current, connection = db(), operationId) {
+    const items = pendingItems(current, connection);
+    return (operationId === undefined ? items[0] : items.find(item => item.operationId === operationId)) ?? null;
+  }
+  function ensureCapacity(current, operationId, connection = db()) {
+    const occupied = new Set([...requests.keys(), ...pendingItems(current, connection).map(item => item.operationId)]);
+    if (!occupied.has(operationId) && occupied.size >= MAX_SYNTHESIS_REQUESTS) fail('SYNTHESIS_LIMIT');
   }
   async function readConfig() {
     try {
@@ -225,13 +279,14 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
   }
   function configuredBefore() { return fs.existsSync(markerFile) || fs.existsSync(configFile); }
   function beginRequest() {
-    if (active) fail('BUSY');
+    if (configuration || requests.size) fail('BUSY');
     const request = { controller: new AbortController(), cancelled: false, timedOut: false };
-    active = request;
+    configuration = request;
     return request;
   }
   async function requestCard(config, cards, request, themes = [], customPrompt = '') {
-    const timer = setTimeout(() => { request.timedOut = true; request.controller.abort(); }, Math.max(1, Math.min(timeoutMs, 60000)));
+    const timer = setTimeout(() => { request.timedOut = true; request.controller.abort(); }, Math.max(1, Math.min(timeoutMs, 180000)));
+    request.timer = timer;
     try {
       const body = { model: config.model, messages: buildSynthesisMessages(cards, themes, customPrompt), stream: false, max_tokens: 1024, response_format: { type: 'json_object' } };
       if (new URL(config.baseUrl).hostname === 'api.deepseek.com') body.thinking = { type: 'disabled' };
@@ -255,7 +310,7 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
     } finally { clearTimeout(timer); }
   }
   function recoveryReplace(value) {
-    if (active) fail('BUSY');
+    if (configuration || requests.size) fail('BUSY');
     // 先在独立库完整写入、关闭，再把损坏原件连同 WAL/SHM 留在原目录；绝不清库修复。
     const temp = path.join(dataDir, `recovered-${randomUUID()}.sqlite3`);
     let replacement, swapping = false, installed = false;
@@ -319,12 +374,28 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
           const next = new Map(value[field].map(item => [item[identity], item]));
           if (current[field].some(item => JSON.stringify(next.get(item[identity])) !== JSON.stringify(item))) fail('INVALID_SAVE');
         }
-        const pending = pendingFor(current, connection);
-        if ((pending || active) && !value.operations.some(operation => operation.id === pending?.operationId) && JSON.stringify(value.mods) !== JSON.stringify(current.mods)) fail('PENDING_SAVE_REQUIRED');
-        if (pending && value.operations.some(operation => operation.id === pending.operationId)) {
-          const expected = commitSynthesis(current, pending);
-          const actualOp = value.operations.find(operation => operation.id === pending.operationId);
-          const expectedOp = expected.save.operations.find(operation => operation.id === pending.operationId);
+        const previousOperations = new Set(current.operations.map(operation => operation.id));
+        const additions = value.operations.filter(operation => !previousOperations.has(operation.id));
+        if (additions.length > 1) fail('INVALID_SAVE');
+        const items = pendingItems(current, connection);
+        const operation = additions[0];
+        const pending = operation ? items.find(item => item.operationId === operation.id) : null;
+        if (!operation && (items.length || requests.size || configuration) && JSON.stringify(value.mods) !== JSON.stringify(current.mods)) fail('PENDING_SAVE_REQUIRED');
+        if (operation) {
+          let input = pending;
+          if (pending && current.mods.some(mod => mod.enabled) && !pending.modProcessed) fail('PENDING_MOD_PROCESSING');
+          if (!input) {
+            // 已知配方可直接离线提交；未知答案必须先有自己的持久化记录。
+            const recipe = findRecipe(current, JSON.parse(operation.recipeKey));
+            if (!recipe || operation.source.kind !== 'recipe') fail('RESULT_REQUIRED');
+            let fingerprint;
+            try { fingerprint = JSON.parse(operation.fingerprint); } catch { fail('INVALID_SAVE'); }
+            input = { operationId: operation.id, ingredientIds: JSON.parse(operation.recipeKey), result: fingerprint.result,
+              now: operation.completedAt, source: { kind: 'recipe' } };
+          }
+          const expected = commitSynthesis(current, input);
+          const actualOp = operation;
+          const expectedOp = expected.save.operations.find(item => item.id === operation.id);
           const withoutTime = (items, field) => items.map(item => { const clean = { ...item }; delete clean[field]; return clean; });
           // 前端可能在 IPC 返回后才取得提交时间；身份、材料、答案与计数必须相同，时间允许向前。
           if (['id', 'recipeKey', 'resultId', 'fingerprint'].some(field => actualOp[field] !== expectedOp[field]) ||
@@ -332,7 +403,7 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
             JSON.stringify(withoutTime(value.recipes, 'createdAt')) !== JSON.stringify(withoutTime(expected.save.recipes, 'createdAt')) ||
             value.stats.synthesisCount !== expected.save.stats.synthesisCount || JSON.stringify(actualOp.source) !== JSON.stringify(expectedOp.source) ||
             JSON.stringify(value.mods) !== JSON.stringify(expected.save.mods)) fail('OPERATION_CONFLICT');
-          connection.exec('DELETE FROM pending');
+          if (pending) connection.prepare('DELETE FROM pending WHERE operation_id=?').run(operation.id);
         }
         writeSnapshot(connection, value);
       });
@@ -345,6 +416,8 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
     async configure(input) {
       configSize(input);
       const normalized = normalizeConfig(input);
+      const current = readCurrent();
+      if (current && pendingItems(current).length) fail('PENDING_SAVE_REQUIRED');
       const request = beginRequest();
       try {
         let key = input.key;
@@ -367,7 +440,7 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
         // 密文已成功保存，标记只为文件丢失时允许玩家先看本地；标记失败不废弃成功配置。
         try { atomicWrite(markerFile, 'configured\n'); } catch {}
         return service.configStatus();
-      } finally { if (active === request) active = null; }
+      } finally { if (configuration === request) configuration = null; }
     },
     async generate({ ingredientIds, operationId } = {}) {
       if (!safeId(operationId)) fail('INVALID_ID');
@@ -376,10 +449,18 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
       const ids = JSON.parse(recipeKey(ingredientIds));
       const cards = ids.map(id => current.cards.find(card => card.id === id));
       if (cards.some(card => !card)) fail('UNKNOWN_INGREDIENT');
-      const existing = pendingFor(current);
+      if (configuration) fail('BUSY');
+      const key = recipeKey(ids);
+      const items = pendingItems(current);
+      const existing = items.find(item => item.operationId === operationId);
       if (existing) {
-        if (existing.operationId === operationId && recipeKey(existing.ingredientIds) === recipeKey(ids)) return copy(existing.result);
-        fail('PENDING_SAVE_REQUIRED');
+        if (recipeKey(existing.ingredientIds) !== key) fail('OPERATION_CONFLICT');
+        return copy(existing.result);
+      }
+      const repeated = requests.get(operationId);
+      if (repeated) {
+        if (repeated.recipeKey !== key) fail('OPERATION_CONFLICT');
+        return repeated.promise;
       }
       const committed = current.operations.find(operation => operation.id === operationId);
       if (committed) {
@@ -388,28 +469,45 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
       }
       const known = findRecipe(current, ids);
       if (known) return validateCardResult(current.cards.find(card => card.id === known.resultId));
-      const request = beginRequest();
-      try {
-        const config = await readConfig();
-        if (!config) fail('KEY_REQUIRED');
-        if (request.cancelled) fail('CANCELLED');
-        const themes = (current.mods || []).filter(mod => mod.enabled).map(mod => mod.manifest.theme).filter(Boolean);
-        // 读取已提交存档的提示；API检测使用默认值，改提示也不会重发已知配方或待存答案。
-        const result = await requestCard(config, cards, request, themes, current.preferences.synthesisPrompt);
-        const pending = { saveId: current.id, operationId, ingredientIds: ids, result, now: new Date().toISOString(), modProcessed: false, source: { kind: 'ai' }, modStates: [] };
-        transaction(connection => {
-          const latest = readCurrent(connection);
-          if (!latest || latest.id !== current.id || latest.createdAt !== current.createdAt) fail('REVISION_CONFLICT');
-          cleanPending(pending, latest);
-          if (pendingFor(latest, connection)) fail('PENDING_SAVE_REQUIRED');
-          connection.prepare('INSERT INTO pending VALUES(1,?)').run(JSON.stringify(pending));
-        });
-        return copy(result);
-      } finally { if (active === request) active = null; }
+      if (items.some(item => recipeKey(item.ingredientIds) === key) || [...requests.values()].some(request => request.recipeKey === key)) fail('SYNTHESIS_ALREADY_RUNNING');
+      ensureCapacity(current, operationId);
+      const request = { controller: new AbortController(), cancelled: false, timedOut: false, recipeKey: key, promise: null };
+      requests.set(operationId, request);
+      request.promise = (async () => {
+        try {
+          const config = await readConfig();
+          if (!config) fail('KEY_REQUIRED');
+          if (request.cancelled) fail('CANCELLED');
+          const themes = (current.mods || []).filter(mod => mod.enabled).map(mod => mod.manifest.theme).filter(Boolean);
+          // 每个答案先单独落盘，后续布局写入和其他请求不会占用或覆盖它的位置。
+          const result = await requestCard(config, cards, request, themes, current.preferences.synthesisPrompt);
+          const pending = { saveId: current.id, operationId, ingredientIds: ids, result, now: new Date().toISOString(), modProcessed: false, source: { kind: 'ai' }, modStates: [] };
+          transaction(connection => {
+            const latest = readCurrent(connection);
+            if (!latest || latest.id !== current.id || latest.createdAt !== current.createdAt) fail('REVISION_CONFLICT');
+            cleanPending(pending, latest);
+            if (pendingFor(latest, connection, operationId)) fail('OPERATION_CONFLICT');
+            connection.prepare('INSERT INTO pending VALUES(?,?)').run(operationId, JSON.stringify(pending));
+          });
+          return copy(result);
+        } finally { if (requests.get(operationId) === request) requests.delete(operationId); }
+      })();
+      return request.promise;
     },
-    cancel() { if (active) { const request = active; active = null; request.cancelled = true; request.controller.abort(); } },
+    cancel(operationId) {
+      if (operationId !== undefined && !safeId(operationId)) fail('INVALID_ID');
+      if (operationId === undefined && configuration) {
+        const request = configuration; configuration = null;
+        request.cancelled = true; clearTimeout(request.timer); request.controller.abort();
+      }
+      for (const [id, request] of requests) {
+        if (operationId !== undefined && id !== operationId) continue;
+        requests.delete(id); request.cancelled = true; clearTimeout(request.timer); request.controller.abort();
+      }
+    },
     stageModResult({ ingredientIds, operationId, result, source, modStates = [] } = {}) {
-      if (active) fail('BUSY');
+      if (configuration) fail('BUSY');
+      if (!safeId(operationId)) fail('INVALID_ID');
       return transaction(connection => {
         const current = readCurrent(connection); if (!current) fail('STORAGE_ERROR');
         const pending = cleanPending({ saveId: current.id, ingredientIds, operationId, result, source, modStates, now: new Date().toISOString(), modProcessed: true }, current);
@@ -418,33 +516,37 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
           const known = findRecipe(current, pending.ingredientIds);
           if (!known || JSON.stringify(validateCardResult(current.cards.find(card => card.id === known.resultId))) !== JSON.stringify(pending.result)) fail('OPERATION_CONFLICT');
         }
-        const existing = pendingFor(current, connection);
+        const existing = pendingFor(current, connection, operationId);
         if (existing) {
-          if (existing.operationId !== operationId) fail('PENDING_SAVE_REQUIRED');
           if (JSON.stringify({ ...pending, now: existing.now }) !== JSON.stringify(existing)) fail('OPERATION_CONFLICT');
           return copy(existing);
         }
         // 重复提交已完成的操作只确认原操作，不重新生成一个未清理journal。
-        if (!current.operations.some(operation => operation.id === operationId)) connection.prepare('INSERT INTO pending VALUES(1,?)').run(JSON.stringify(pending));
+        if (!current.operations.some(operation => operation.id === operationId)) {
+          if (pendingItems(current, connection).some(item => recipeKey(item.ingredientIds) === recipeKey(pending.ingredientIds))) fail('SYNTHESIS_ALREADY_RUNNING');
+          ensureCapacity(current, operationId, connection);
+          connection.prepare('INSERT INTO pending VALUES(?,?)').run(operationId, JSON.stringify(pending));
+        }
         return copy(pending);
       });
     },
     updatePending({ operationId, result, source, modStates } = {}) {
-      if (active) fail('BUSY');
+      if (configuration) fail('BUSY');
+      if (!safeId(operationId)) fail('INVALID_ID');
       return transaction(connection => {
         const current = readCurrent(connection); if (!current) fail('STORAGE_ERROR');
-        const existing = pendingFor(current, connection);
+        const existing = pendingFor(current, connection, operationId);
         if (!existing) fail('PENDING_NOT_FOUND');
         if (existing.operationId !== operationId) fail('OPERATION_CONFLICT');
         const pending = cleanPending({ ...existing, result, modProcessed: true,
           ...(source === undefined ? {} : { source }), ...(modStates === undefined ? {} : { modStates }) }, current);
-        connection.prepare('UPDATE pending SET document=? WHERE singleton=1').run(JSON.stringify(pending));
+        connection.prepare('UPDATE pending SET document=? WHERE operation_id=?').run(JSON.stringify(pending), operationId);
         return copy(pending);
       });
     },
     exportJSON() { const current = readCurrent(); if (!current) fail('STORAGE_ERROR'); return serializeSave(current); },
     importSave(snapshot) {
-      if (active) fail('BUSY');
+      if (configuration || requests.size) fail('BUSY');
       const value = typeof snapshot === 'string' ? parseSave(snapshot) : checkedSave(snapshot);
       let current;
       try { current = readCurrent(); }
@@ -464,13 +566,22 @@ export function createService({ dataDir, credentialDir = dataDir, requireExistin
       });
       return rememberCommitted(value);
     },
-    loadPending() {
+    loadPending(operationId) {
+      if (operationId !== undefined && !safeId(operationId)) fail('INVALID_ID');
+      const pending = service.listPending();
+      return (operationId === undefined ? pending[0] : pending.find(item => item.operationId === operationId)) ?? null;
+    },
+    listPending() {
       const current = readCurrent();
-      if (!current) return null;
-      const pending = pendingFor(current);
-      if (!pending) return null;
-      if (current.operations.some(operation => operation.id === pending.operationId)) { transaction(connection => connection.exec('DELETE FROM pending')); return null; }
-      return copy(pending);
+      if (!current) return [];
+      const pending = pendingItems(current);
+      const committed = new Set(current.operations.map(operation => operation.id));
+      const finished = pending.filter(item => committed.has(item.operationId));
+      if (finished.length) transaction(connection => {
+        const remove = connection.prepare('DELETE FROM pending WHERE operation_id=?');
+        for (const item of finished) remove.run(item.operationId);
+      });
+      return copy(pending.filter(item => !committed.has(item.operationId)));
     },
     listBackups() {
       let files;

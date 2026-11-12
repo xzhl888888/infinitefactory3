@@ -11,6 +11,14 @@ interface SlotStorage {
     JSONObject save(JSONObject save,long expectedRevision);
     JSONObject importSave(JSONObject save);
     JSONObject loadPending();
+    default JSONObject loadPending(String operationId) {
+        JSONObject pending = loadPending();
+        return pending != null && (operationId == null || operationId.equals(pending.opt("operationId"))) ? pending : null;
+    }
+    default JSONArray listPending() {
+        JSONObject pending = loadPending();
+        return pending == null ? new JSONArray() : new JSONArray().put(pending);
+    }
     void putPending(JSONObject pending);
     void updatePending(JSONObject pending,String operationId);
     JSONArray listBackups();

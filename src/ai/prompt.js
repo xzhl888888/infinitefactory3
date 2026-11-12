@@ -2,6 +2,7 @@ import { CATEGORIES, CARD_LIMITS } from '../content/catalog.js';
 
 // 创作提示随存档保存；输出协议由程序追加，不能因编辑创作风格而失去可校验的数据结构。
 export const SYNTHESIS_PROMPT_LIMIT = 12000;
+// 沿用二代最终S3的通用造卡指导；旧星空分类与旧JSON字段不带入三代。
 export const DEFAULT_SYNTHESIS_PROMPT = `你是合成游戏的引擎。玩家把几样东西合在一起，请给出一个合成结果。
 
 要求：

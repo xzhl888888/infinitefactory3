@@ -45,7 +45,7 @@ export function createHome({ enter, saves, mods }) {
     gold.hidden = true;
   });
   gold.setAttribute('aria-label', '金色工厂');
-  const version = button('wx-home-version', 'v0.2.3', tapVersion);
+  const version = button('wx-home-version', 'v0.2.5', tapVersion);
   const note = element('dialog', 'wx-home-note');
   note.setAttribute('aria-label', '制作人的小纸条');
   note.append(element('h2', '', '制作人的小纸条'), element('p','','谢谢你来玩《无限工厂 3》！'),

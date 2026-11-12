@@ -534,3 +534,39 @@ test('静态等待稳定后数百次RAF不整屏重绘，保存与提交状态�
     } finally { h.close(); }
   }
 });
+
+
+test('两组拖叠各自持有材料和卡背，较早结果落盘揭晓不接管另一任务',()=>{
+  const jobs=[];let h;
+  h=harness({onCombine({ids,update}){
+    const job={id:'parallel:'+jobs.length,ingredientIds:ids,source:'ai',phase:'requesting'};jobs.push(job);
+    update({syntheses:copy(jobs),synthesis:job,busy:'combine',canCombine:true});
+  }});
+  try{
+    h.update({syntheses:[],canCombine:true});h.advance(FRAME);
+    h.emit('pointerdown',1,248,270);h.emit('pointermove',1,364,270);h.emit('pointerup',1,364,270);
+    h.advance(300);
+    h.emit('pointerdown',2,480,270);h.emit('pointermove',2,596,270);h.emit('pointerup',2,596,270);
+    const both=h.advance(500);assert.equal(jobs.length,2);
+    const backs=frame=>texts(frame).filter(record=>record.args[0]==='无限工厂3').length;
+    assert.equal(backs(both),2,'两个真实卡背同时可见');
+    const result={operationId:jobs[0].id,card:copy(RESULT),isNewCard:true,isNewRecipe:true};
+    jobs[0]={...jobs[0],phase:'committed',result};
+    const save=copy(h.state.save);save.cards.push(copy(RESULT));save.revision++;
+    h.update({save,syntheses:copy(jobs),synthesis:jobs[1],busy:'combine',canCombine:true});
+    const partial=h.advance(FRAME);assert.equal(backs(partial),1);assert.equal(h.calls.reveal.length,1);
+    assert.equal(h.calls.reveal[0].result.operationId,jobs[0].id);assert.ok(includesText(partial,'工具'));
+    jobs[1]={...jobs[1],phase:'failed'};h.update({syntheses:copy(jobs),busy:false,canCombine:true});
+    const failed=h.advance(500);assert.equal(backs(failed),0);assert.ok(includesText(failed,'水'));assert.ok(includesText(failed,'火'));
+    assert.equal(h.calls.reveal.length,1);
+  }finally{h.close();}
+});
+
+test('queued卡背静态等待保存，后续恢复提交仍能揭晓同一份结果',()=>{
+  const h=harness();try{
+    h.begin();h.advance(500);h.phase('queued');
+    const first=h.advance(FRAME);assert.ok(includesText(first,'等待保存'));assert.equal(h.calls.reveal.length,0);
+    const paints=h.paintCount;h.advance(3000);assert.equal(h.paintCount,paints,'等待前项补存期间不循环重绘静态卡背');
+    h.phase('saving');h.commit();assert.ok(includesText(h.advance(FRAME),'工具'));assert.equal(h.calls.reveal.length,1);
+  }finally{h.close();}
+});

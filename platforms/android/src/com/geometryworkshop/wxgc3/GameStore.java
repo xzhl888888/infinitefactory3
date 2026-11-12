@@ -25,21 +25,66 @@ final class GameStore implements SlotStorage {
             Fault.require(!mustExist||activeFile.isFile(),"STORAGE_CORRUPT");
             Fault.require(!(activeFile.exists()&&activeFile.length()==0)&&(!hadProgress||activeFile.isFile()),"STORAGE_CORRUPT");
             db=open(file);Fault.require(!hadProgress||load()!=null,"STORAGE_CORRUPT");load();
-        }catch(Exception e){failure="STORAGE_CORRUPT";if(db!=null){db.close();db=null;}}
+        }catch(Exception e){failure=e instanceof Fault&&"MIGRATION_BACKUP_FAILED".equals(((Fault)e).code)?"MIGRATION_BACKUP_FAILED":"STORAGE_CORRUPT";if(db!=null){db.close();db=null;}}
     }
     private SQLiteDatabase open(String name) {
         // 默认Android损坏回调会删除数据库；这里明确保留坏库和日志，交给玩家选择恢复。
         SQLiteDatabase opened=SQLiteDatabase.openDatabase(new File(directory,name).getAbsolutePath(),null,SQLiteDatabase.OPEN_READWRITE|SQLiteDatabase.CREATE_IF_NECESSARY,corrupt -> {});
         try {
             opened.execSQL("PRAGMA synchronous=FULL");opened.enableWriteAheadLogging();
-            if(opened.getVersion()==0){
-                try(Cursor cursor=opened.rawQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",null)){cursor.moveToFirst();Fault.require(cursor.getInt(0)==0,"STORAGE_CORRUPT");}
-                opened.beginTransaction();try{opened.execSQL("CREATE TABLE current_save (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, document TEXT NOT NULL)");opened.execSQL("CREATE TABLE pending_result (singleton INTEGER PRIMARY KEY CHECK(singleton=1), document TEXT NOT NULL)");opened.setVersion(1);opened.setTransactionSuccessful();}finally{opened.endTransaction();}
-            }
-            Fault.require(opened.getVersion()==1,"UNSUPPORTED_SAVE_VERSION");
+            // 先确认旧库完整，再进行表结构迁移。
             try(Cursor c=opened.rawQuery("PRAGMA quick_check",null)){Fault.require(c.moveToFirst()&&"ok".equals(c.getString(0)),"STORAGE_CORRUPT");}
+            if(opened.getVersion()==0){
+                // Android 首次打开空库也会创建语言表。遇到其他业务对象时保留现场，交给存档恢复处理。
+                String unexpectedObjects = "SELECT 1 FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' "
+                    + "AND NOT (type='table' AND name='android_metadata') LIMIT 1";
+                try (Cursor cursor = opened.rawQuery(unexpectedObjects, null)) {
+                    Fault.require(!cursor.moveToFirst(), "STORAGE_CORRUPT");
+                }
+                opened.beginTransaction();
+                try {
+                    opened.execSQL("CREATE TABLE current_save (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, document TEXT NOT NULL)");
+                    opened.execSQL("CREATE TABLE pending_result (operation_id TEXT PRIMARY KEY NOT NULL, document TEXT NOT NULL)");
+                    opened.setVersion(2);
+                    opened.setTransactionSuccessful();
+                } finally { opened.endTransaction(); }
+            }
+            if (opened.getVersion() == 1) migratePending(opened);
+            Fault.require(opened.getVersion()==2,"UNSUPPORTED_SAVE_VERSION");
             return opened;
         }catch(Exception e){opened.close();throw e;}
+    }
+    private void preserveOriginal(String filename, String text) {
+        if (text == null) return;
+        File original = new File(directory, filename);
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (!original.exists() && !new File(original.getPath()+".bak").exists()) PrivateFiles.writeAtomic(original, bytes, "MIGRATION_BACKUP_FAILED");
+        Fault.require(Arrays.equals(bytes, PrivateFiles.readAtomic(original, SaveCodec.MAX_BYTES, "MIGRATION_BACKUP_FAILED")), "MIGRATION_BACKUP_FAILED");
+    }
+    private void migratePending(SQLiteDatabase opened) {
+        String save = null, pending = null;
+        try (Cursor cursor = opened.rawQuery("SELECT document FROM current_save WHERE singleton=1", null)) {
+            if (cursor.moveToFirst()) save = cursor.getString(0);
+        }
+        try (Cursor cursor = opened.rawQuery("SELECT document FROM pending_result WHERE singleton=1", null)) {
+            if (cursor.moveToFirst()) pending = cursor.getString(0);
+        }
+        // 旧库升级前另存原文。事务失败仍保留旧表，原文也不参与五槽副本轮换。
+        preserveOriginal("database-v1-save-original.json", save);
+        preserveOriginal("database-v1-pending-original.json", pending);
+        opened.beginTransaction();
+        try {
+            opened.execSQL("CREATE TABLE pending_result_v2 (operation_id TEXT PRIMARY KEY NOT NULL, document TEXT NOT NULL)");
+            if (pending != null) {
+                String operationId = SaveCodec.id(SaveCodec.parse(pending).opt("operationId"));
+                Fault.require(operationId.length() <= 128, "STORAGE_CORRUPT");
+                opened.execSQL("INSERT INTO pending_result_v2(operation_id,document) VALUES(?,?)", new Object[]{operationId,pending});
+            }
+            opened.execSQL("DROP TABLE pending_result");
+            opened.execSQL("ALTER TABLE pending_result_v2 RENAME TO pending_result");
+            opened.setVersion(2);
+            opened.setTransactionSuccessful();
+        } finally { opened.endTransaction(); }
     }
     private void ready(){Fault.require(db!=null&&failure==null,failure==null?"STORAGE_ERROR":failure);}
     public synchronized JSONObject status(){return SaveCodec.record("storageAvailable",db!=null&&failure==null,"error",failure,"backupWarning",backupWarning);}
@@ -62,30 +107,92 @@ final class GameStore implements SlotStorage {
         ready();JSONObject next=codec.validate(raw);db.beginTransaction();
         try {
             JSONObject current=load();Fault.require(current!=null,"INVALID_SAVE");
-            Fault.require(SaveCodec.integer(current.opt("revision"))==expected&&expected<SaveCodec.MAX_INTEGER&&SaveCodec.integer(next.opt("revision"))==expected+1,"REVISION_CONFLICT");
+            Fault.require(expected<SaveCodec.MAX_INTEGER&&SaveCodec.integer(next.opt("revision"))==expected+1,"REVISION_CONFLICT");
+            // 提交已成功但桥接响应丢失时，只确认同一完整快照，不重复计数或清理其他操作的答案。
+            if (SaveCodec.integer(current.opt("revision"))==SaveCodec.integer(next.opt("revision"))&&SaveCodec.same(current,next)) {
+                db.setTransactionSuccessful();return current;
+            }
+            Fault.require(SaveCodec.integer(current.opt("revision"))==expected,"REVISION_CONFLICT");
             Fault.require(current.opt("id").equals(next.opt("id"))&&current.opt("createdAt").equals(next.opt("createdAt"))&&SaveCodec.str(next.opt("updatedAt")).compareTo(SaveCodec.str(current.opt("updatedAt")))>=0,"INVALID_SAVE");
-            JSONObject pending=loadPending();boolean clear=codec.transition(current,next,pending);
-            backup(current,"before-save");write(next);if(clear)db.execSQL("DELETE FROM pending_result WHERE singleton=1");db.setTransactionSuccessful();return next;
+            Set<String> committedIds = SaveCodec.indexed(SaveCodec.arr(current.opt("operations"),100000),"id").keySet();
+            String addedId = null;
+            JSONArray operations = SaveCodec.arr(next.opt("operations"),100000);
+            for (int i = 0; i < operations.length(); i++) {
+                String id = SaveCodec.str(SaveCodec.obj(operations.opt(i)).opt("id"));
+                if (!committedIds.contains(id)) {
+                    Fault.require(addedId == null, "INVALID_SAVE");
+                    addedId = id;
+                }
+            }
+            JSONObject pending = addedId == null ? loadPending() : loadPending(addedId);
+            boolean clear = codec.transition(current,next,pending);
+            backup(current,"before-save");
+            write(next);
+            if (clear) db.execSQL("DELETE FROM pending_result WHERE operation_id=?", new Object[]{pending.opt("operationId")});
+            db.setTransactionSuccessful();return next;
         }catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
     }
     public synchronized JSONObject importSave(JSONObject raw){
         JSONObject next=codec.validate(raw);ready();db.beginTransaction();
         try{JSONObject current=load();Fault.require(loadPending()==null,"BUSY");long revision=current==null?0:SaveCodec.integer(current.opt("revision"))+1;Fault.require(revision<=SaveCodec.MAX_INTEGER,"REVISION_CONFLICT");if(current!=null)backup(current,"before-import");SaveCodec.put(next,"revision",revision);write(next);db.setTransactionSuccessful();return next;}catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
     }
-    public synchronized JSONObject loadPending(){
-        ready();try(Cursor c=db.rawQuery("SELECT document FROM pending_result WHERE singleton=1",null)){
-            if(!c.moveToFirst())return null;JSONObject raw=SaveCodec.parse(c.getString(0)),current=load();
-            Fault.require(current!=null&&current.opt("id").equals(raw.opt("saveId")),"STORAGE_CORRUPT");String operation=SaveCodec.id(raw.opt("operationId"));Fault.require(operation.length()<=128,"STORAGE_CORRUPT");JSONArray ids=SaveCodec.parseArray(SaveCodec.recipeKey(raw.opt("ingredientIds")));JSONObject result=codec.card(raw.opt("result"));String now=SaveCodec.stamp(raw.opt("now"));
-            JSONArray mods=SaveCodec.arr(current.opt("mods"),16);JSONObject source=codec.modCodec.source(raw.opt("source"),mods);JSONArray states=codec.modCodec.states(raw.opt("modStates"),mods);
-            Object processed=raw.has("modProcessed")?raw.opt("modProcessed"):false;Fault.require(processed instanceof Boolean,"STORAGE_CORRUPT");
-            return SaveCodec.record("saveId",current.opt("id"),"operationId",operation,"ingredientIds",ids,"result",result,"now",now,"source",source,"modStates",states,"modProcessed",processed);
-        }catch(Exception e){failure="STORAGE_CORRUPT";throw new Fault(failure);}
+    private JSONObject checkedPending(String text, String expectedId, JSONObject current) {
+        JSONObject raw = SaveCodec.parse(text);
+        Fault.require(current != null && current.opt("id").equals(raw.opt("saveId")),"STORAGE_CORRUPT");
+        String operation = SaveCodec.id(raw.opt("operationId"));
+        Fault.require(operation.length() <= 128 && operation.equals(expectedId),"STORAGE_CORRUPT");
+        JSONArray ids = SaveCodec.parseArray(SaveCodec.recipeKey(raw.opt("ingredientIds")));
+        JSONObject result = codec.card(raw.opt("result"));
+        String now = SaveCodec.stamp(raw.opt("now"));
+        JSONArray mods = SaveCodec.arr(current.opt("mods"),16);
+        JSONObject source = codec.modCodec.source(raw.opt("source"),mods);
+        JSONArray states = codec.modCodec.states(raw.opt("modStates"),mods);
+        Object processed = raw.has("modProcessed") ? raw.opt("modProcessed") : false;
+        Fault.require(processed instanceof Boolean,"STORAGE_CORRUPT");
+        return SaveCodec.record("saveId",current.opt("id"),"operationId",operation,"ingredientIds",ids,
+            "result",result,"now",now,"source",source,"modStates",states,"modProcessed",processed);
+    }
+    public synchronized JSONObject loadPending() { return loadPending(null); }
+    public synchronized JSONObject loadPending(String operationId) {
+        ready();
+        String query = operationId == null
+            ? "SELECT operation_id,document FROM pending_result ORDER BY rowid LIMIT 1"
+            : "SELECT operation_id,document FROM pending_result WHERE operation_id=?";
+        try (Cursor cursor = db.rawQuery(query, operationId == null ? null : new String[]{operationId})) {
+            return cursor.moveToFirst() ? checkedPending(cursor.getString(1),cursor.getString(0),load()) : null;
+        } catch (Exception e) { failure="STORAGE_CORRUPT";throw new Fault(failure); }
+    }
+    public synchronized JSONArray listPending() {
+        ready();JSONArray result = new JSONArray();
+        try (Cursor cursor = db.rawQuery("SELECT operation_id,document FROM pending_result ORDER BY rowid",null)) {
+            JSONObject current = load();
+            while (cursor.moveToNext()) result.put(checkedPending(cursor.getString(1),cursor.getString(0),current));
+            return result;
+        } catch (Exception e) { failure="STORAGE_CORRUPT";throw new Fault(failure); }
     }
     public synchronized void putPending(JSONObject raw){
-        ready();db.beginTransaction();try{JSONObject current=load();Fault.require(current!=null&&current.opt("id").equals(raw.opt("saveId")),"REVISION_CONFLICT");Fault.require(loadPending()==null,"BUSY");db.execSQL("INSERT INTO pending_result(singleton,document) VALUES(1,?)",new Object[]{raw.toString()});db.setTransactionSuccessful();}catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
+        ready();db.beginTransaction();
+        try {
+            String operationId = SaveCodec.id(raw.opt("operationId"));
+            JSONObject current = load();
+            Fault.require(current!=null&&current.opt("id").equals(raw.opt("saveId")),"REVISION_CONFLICT");
+            JSONObject clean = checkedPending(raw.toString(),operationId,current);
+            JSONObject existing = loadPending(operationId);
+            if (existing != null) Fault.require(SaveCodec.same(existing,clean),"OPERATION_CONFLICT");
+            else db.execSQL("INSERT INTO pending_result(operation_id,document) VALUES(?,?)",new Object[]{operationId,clean.toString()});
+            db.setTransactionSuccessful();
+        } catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
     }
     public synchronized void updatePending(JSONObject raw,String operationId){
-        ready();db.beginTransaction();try{JSONObject pending=loadPending();Fault.require(pending!=null&&operationId.equals(pending.opt("operationId")),"OPERATION_CONFLICT");Fault.require(pending.opt("saveId").equals(raw.opt("saveId"))&&pending.opt("now").equals(raw.opt("now"))&&SaveCodec.recipeKey(pending.opt("ingredientIds")).equals(SaveCodec.recipeKey(raw.opt("ingredientIds"))),"OPERATION_CONFLICT");db.execSQL("UPDATE pending_result SET document=? WHERE singleton=1",new Object[]{raw.toString()});db.setTransactionSuccessful();}catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
+        ready();db.beginTransaction();
+        try {
+            JSONObject pending = loadPending(operationId);
+            Fault.require(pending!=null&&operationId.equals(raw.opt("operationId")),"OPERATION_CONFLICT");
+            Fault.require(pending.opt("saveId").equals(raw.opt("saveId"))&&pending.opt("now").equals(raw.opt("now"))&&SaveCodec.recipeKey(pending.opt("ingredientIds")).equals(SaveCodec.recipeKey(raw.opt("ingredientIds"))),"OPERATION_CONFLICT");
+            JSONObject clean = checkedPending(raw.toString(),operationId,load());
+            db.execSQL("UPDATE pending_result SET document=? WHERE operation_id=?",new Object[]{clean.toString(),operationId});
+            db.setTransactionSuccessful();
+        }catch(Fault e){throw e;}catch(Exception e){throw new Fault("SAVE_WRITE_FAILED");}finally{db.endTransaction();}
     }
     private void backup(JSONObject save,String reason){
         List<JSONObject> all=backupsInternal();Set<String> ids=new HashSet<>();for(JSONObject b:all)ids.add(SaveCodec.str(b.opt("id")));String slot=null;for(int i=0;i<5;i++)if(!ids.contains("slot-"+i)){slot="slot-"+i;break;}if(slot==null)slot=SaveCodec.str(all.get(all.size()-1).opt("id"));

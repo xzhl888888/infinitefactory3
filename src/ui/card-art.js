@@ -1,14 +1,20 @@
-// 卡牌以 84×108 为基准，画布按显示宽度等比缩放。
+// 绘制母本：旧版 01-引擎.js，2026-10-26；完整来源见 docs/旧版复用核对.md。
+// SHA-256: 044b5df27713ac10dd246e7fc869677a4bd8a6733768f85b16a84ef78b1b93fd
+// 旧工厂基准为 84×108（7:9）；绘制内部继续以宽度 / 84 等比缩放。
+// 保留普通 card()、limOverlay()、cardBack() 的坐标、线宽和色值；
+// 数据字段改接本地卡牌，外观只来自偏好，不读取账号、等级或全服身份。
 import { listModAppearances } from '../core/mods.js';
 import { createModImages } from '../mods/media.js';
 export const PALETTE = Object.freeze({ ink:'#23303a', gold:'#c79a3e', paper:'#f4efe6', panel:'#faf6ee', teal:'#1fb6a6' });
 const CATS = {自然:['#e6f4ff','#2f6fd0'],生物:['#e8f7e9','#2e8b57'],科技:['#efeaff','#6a4fd0'],人文:['#fff0e6','#c0612a'],食物:['#fff3e0','#c9920f'],抽象:['#eef0f2','#5b6b78'],整活:['#ffe9f0','#c2557a']};
 const SKINS = new Set(['default', 'sea', 'hearth', 'starfire', 'firefly', 'dawn']);
-export function createCardPainter(ctx, { getMods = () => [], onAssetReady = () => {}, images = createModImages(onAssetReady) } = {}) {
+export function createCardPainter(ctx, { getMods = () => [], onAssetReady = () => {}, images, cacheStatic = false } = {}) {
+ const baseTextures = new Map(), contentTextures = new Map();
+ images ||= createModImages(() => { baseTextures.clear(); contentTextures.clear(); onAssetReady(); });
  let previousMods, appearances;
  function appearance(kind,id) {
    const mods=getMods();
-   if(mods!==previousMods){previousMods=mods;appearances={skins:listModAppearances(mods,'skins'),cardBacks:listModAppearances(mods,'cardBacks')};}
+   if(mods!==previousMods){if(previousMods?.length||mods.length){baseTextures.clear();contentTextures.clear();}previousMods=mods;appearances={skins:listModAppearances(mods,'skins'),cardBacks:listModAppearances(mods,'cardBacks')};}
    return appearances[kind].find(v=>v.id===id);
  }
  function imageLayer(custom,x,y,w,h,r) {
@@ -106,18 +112,41 @@ function cardBack(cx,cy,w,h,now,rainbow){ var f=w/84, x=-w/2, y=-h/2, r=13*f, t=
 }
 
 
- function drawCard(cx,cy,w,h,c,opt={}){
-  const f=w/84, now=opt.now||0, x=-w/2, y=-h/2, r=13*f;
-  const skin=SKINS.has(opt.skinId)?opt.skinId:'default',custom=appearance('skins',opt.skinId);
-  FXSET.fx=opt.animate!==false;
-  ctx.save(); ctx.translate(cx,cy); if(opt.rotation) ctx.rotate(opt.rotation);
-  // 普通卡牌采用纸面、柔影、顶部高光及单层边框。
+ // 静态卡底和文字先画成高清纹理；皮肤的动态覆盖层仍逐帧按原版绘制。
+ // 缓存只用于真实浏览器画布，记录式测试与外部调用继续走相同的矢量绘制。
+ function staticLayer(cache, key, w, h, padding, draw) {
+   if (!cacheStatic || !ctx.canvas?.ownerDocument || !ctx.getTransform) return false;
+   const transform = ctx.getTransform();
+   const ratio = Math.max(2, Math.min(4, Math.ceil(Math.hypot(transform.a, transform.b) * w / 84)));
+   const logicalHeight = Math.round(h / w * 84000) / 1000;
+   const identity = JSON.stringify([ratio, logicalHeight, key]);
+   let image = cache.get(identity);
+   if (!image) {
+     image = ctx.canvas.ownerDocument.createElement('canvas');
+     image.width = Math.ceil((84 + padding * 2) * ratio);
+     image.height = Math.ceil((logicalHeight + padding * 2) * ratio);
+     const target = image.getContext('2d'), previous = ctx;
+     target.setTransform(ratio, 0, 0, ratio, (42 + padding) * ratio, (logicalHeight / 2 + padding) * ratio);
+     try { ctx = target; draw(84, logicalHeight); } finally { ctx = previous; }
+     const limit = cache === baseTextures ? 16 : 64;
+     if (cache.size >= limit) cache.delete(cache.keys().next().value);
+     cache.set(identity, image);
+   }
+   const scale = w / 84;
+   ctx.drawImage(image, -w / 2 - padding * scale, -h / 2 - padding * scale,
+     image.width / ratio * scale, image.height / ratio * scale);
+   return true;
+ }
+ function cardBase(w, h, skin, custom, opt) {
+   const f = w / 84, x = -w / 2, y = -h / 2, r = 13 * f;
+  // 旧版 card() 的普通卡分支：纸面、柔影、顶部高光及单层边框。
   ctx.save(); ctx.shadowColor='rgba(40,55,70,'+(opt.lift?0.3:0.18)+')'; ctx.shadowBlur=(opt.lift?18:10)*f; ctx.shadowOffsetY=(opt.lift?9:5)*f; rr(x,y,w,h,r); ctx.fillStyle=custom?.face||PAPER; ctx.fill(); ctx.restore();
   imageLayer(custom,x,y,w,h,r);
   ctx.save(); rr(x,y,w,h,r); ctx.clip(); const tg=ctx.createLinearGradient(0,y,0,y+h*0.4); tg.addColorStop(0,'rgba(255,255,255,.5)'); tg.addColorStop(1,'rgba(255,255,255,0)'); ctx.fillStyle=tg; ctx.fillRect(x,y,w,h*0.4); ctx.restore();
-  const aNow=FXSET.fx?now:0;
   if(skin!=='dawn'&&skin!=='hearth'&&skin!=='starfire'){ ctx.lineWidth=1.8*f; ctx.strokeStyle=custom?.border||'rgba(35,48,58,.7)'; rr(x,y,w,h,r); ctx.stroke(); }
-  if(skin!=='default') limOverlay(x,y,w,h,r,skin,aNow,FXSET.fx,false);
+ }
+ function cardContent(w, h, c, custom) {
+   const f = w / 84, x = -w / 2, y = -h / 2;
   const cc=CATS[c.category]||CATS['抽象'];
   ctx.font=SB(9*f); ctx.fillStyle=custom?.accent||cc[1]; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(c.category,0,y+11*f);
   ctx.strokeStyle=LINE; ctx.lineWidth=1*f; ctx.beginPath(); ctx.moveTo(x+w*0.2,y+19*f); ctx.lineTo(x+w*0.8,y+19*f); ctx.stroke();
@@ -131,16 +160,28 @@ function cardBack(cx,cy,w,h,now,rainbow){ var f=w/84, x=-w/2, y=-h/2, r=13*f, t=
   let cap=c.isBase?'· 本源 ·':'· 我的发现 ·';
   while(ctx.measureText(cap).width>w-10*f&&cap.length>1) cap=cap.slice(0,-1);
   ctx.fillText(cap,0,y+h-10*f);
-  // 角标显示材料的选择顺序。
-  if(opt.selected){rr(x-4*f,y-4*f,w+8*f,h+8*f,r+3*f);ctx.lineWidth=2.6*f;ctx.strokeStyle='#1fb6a6';ctx.stroke();ctx.beginPath();ctx.arc(x+w-1*f,y+1*f,9*f,0,7);ctx.fillStyle='#1fb6a6';ctx.fill();ctx.fillStyle='#fff';ctx.font=B(10*f);ctx.fillText(String(opt.selectionIndex||'✓'),x+w-1*f,y+1*f);}
-  ctx.restore();
  }
- // 词典格单独绘制，行列尺寸跟随词典宽度。
+ function drawCard(cx,cy,w,h,c,opt={}) {
+   const f = w / 84, x = -w / 2, y = -h / 2, r = 13 * f, now = opt.now || 0;
+   const skin = SKINS.has(opt.skinId) ? opt.skinId : 'default', custom = appearance('skins',opt.skinId);
+   FXSET.fx = opt.animate !== false;
+   ctx.save(); ctx.translate(cx,cy); if(opt.rotation) ctx.rotate(opt.rotation);
+   const baseKey = [skin, !!opt.lift, custom?.id, custom?.face, custom?.border];
+   if (!staticLayer(baseTextures, baseKey, w, h, 40, (a,b) => cardBase(a,b,skin,custom,opt))) cardBase(w,h,skin,custom,opt);
+   if (skin !== 'default') limOverlay(x,y,w,h,r,skin,FXSET.fx?now:0,FXSET.fx,false);
+   const contentKey = [c.name,c.emoji,c.category,!!c.isBase,custom?.ink,custom?.accent];
+   if (!staticLayer(contentTextures, contentKey, w, h, 0, (a,b) => cardContent(a,b,c,custom))) cardContent(w,h,c,custom);
+  // 选中是当前合成操作状态，与收藏、拥有或全服稀有身份无关。
+  if(opt.selected){rr(x-4*f,y-4*f,w+8*f,h+8*f,r+3*f);ctx.lineWidth=2.6*f;ctx.strokeStyle='#1fb6a6';ctx.stroke();ctx.beginPath();ctx.arc(x+w-1*f,y+1*f,9*f,0,7);ctx.fillStyle='#1fb6a6';ctx.fill();ctx.fillStyle='#fff';ctx.font=B(10*f);ctx.fillText(String(opt.selectionIndex||'✓'),x+w-1*f,y+1*f);}
+   ctx.restore();
+ }
+ // 词典格独立沿用旧工厂界面.js 的 dcell()，不是缩小后的 7:9 立牌。
+ // 母本 SHA-256: f3e221989825c13be2e379ef2f1e7f09e8267664127cd3a75fe91daac8691591
  // x/y 为左上角；典型格高 58，宽度由词典列数决定。格内皮肤始终静态。
  function drawTile(x,y,w,h,c,opt={}){
   const skin=SKINS.has(opt.skinId)?opt.skinId:'default',custom=appearance('skins',opt.skinId);
   ctx.save();
-  // 词典格阴影下移两个设计像素。
+  // 对应旧 block(..., off=2) 的工厂阴影；不再按在线拥有状态降低透明度。
   ctx.save(); ctx.shadowColor='rgba(47,58,74,.20)'; ctx.shadowBlur=2*1.8+2; ctx.shadowOffsetY=2*0.8+1;
   rr(x,y,w,h,10); ctx.fillStyle=custom?.face||PAPER; ctx.fill(); ctx.restore();
   imageLayer(custom,x,y,w,h,10);

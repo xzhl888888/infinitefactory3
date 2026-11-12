@@ -1,4 +1,7 @@
-// 动画由本模块绘制，调用方管理请求、存档提交和阶段切换。
+// 从旧版的纯动画片段提取，调用方管理请求、存档提交和阶段切换。
+// 01-引擎.js SHA-256: 044b5df27713ac10dd246e7fc869677a4bd8a6733768f85b16a84ef78b1b93fd
+// 工厂界面.js SHA-256: f3e221989825c13be2e379ef2f1e7f09e8267664127cd3a75fe91daac8691591
+// 母本没有独立材料飞拢/翻面插值；等待结束后是 scale=.2 的结果卡弹出。
 // 本模块不消费材料、不写入卡牌，也不把请求返回视为已经保存成功。
 
 export const LEGACY_MOTION = Object.freeze({
@@ -51,7 +54,7 @@ export function easeOutBack(value) {
 }
 export function easeOutCubic(value) { return 1 - Math.pow(1 - value, 3); }
 
-// 按实际经过时间插值，保持不同刷新率下的移动速度一致。
+// 母本按帧追随；这里保持60Hz的一步原值，并让高刷新率/掉帧时有相同的真实时间手感。
 // 拖动时位置仍应直接跟随手指；此函数用于松手后的尺寸恢复、归位和结果弹出。
 export function followLegacy(value, target, factor, dtMs = SYNTHESIS_TIMINGS.frame) {
   if (dtMs <= 0) return value;
@@ -189,7 +192,7 @@ export function drawDiscovery(ctx, painter, {
   return true;
 }
 
-// 飘字采用30像素上移和1.6倍余寿透明度；文本与错误含义由界面提供。
+// 飘字保持旧版30像素上移和1.6倍余寿透明度；文本与错误含义由界面提供。
 export function drawFloatingText(ctx, { x, y, text, color, born, until, reduceMotion=false }, now) {
   if (until <= born || now < born || now >= until) return false;
   const life = (until - now) / (until - born);
@@ -218,7 +221,7 @@ export const SYNTHESIS_SOUNDS = Object.freeze({
 });
 
 // 调用方在用户手势中创建/恢复AudioContext，并先检查声音偏好；不在这里擅自开声音。
-// 音量包络：20ms起音、指数衰减到0.0001、尾部30ms后停止振荡器。
+// 包络完全沿用旧 tone()：20ms起音、指数衰减到0.0001、尾部30ms后停止振荡器。
 export function playSynthesisSound(audioContext, kind) {
   const notes = SYNTHESIS_SOUNDS[kind];
   if (!audioContext || !notes) return false;

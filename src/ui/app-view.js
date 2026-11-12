@@ -23,15 +23,17 @@ export function createAppView(root, callbacks = {}) {
   let factory=null,presentationBusy=false,pendingSlots=null,revealedId=null,saveEpoch=0,restoreSelection=null;
   let newSlotName='',renameId=null,renameName='',recordQuery='',recordSource='',recordCategory='',recordPage=0,recordDiscovery='',modEnableId=null,modRemoveId=null;
   let paintedMods=null;
+  let selectionVersion=0,taskClock=null,tileAssetVersion=0,tileMods=null,tileSkin=null,tileAppearance='';
+  const submittedSelections=new Map(),tilePaints=new WeakMap();
   let homeActive=true, discoveries=0;
   let promptDraft=null;
   // 一个视图共用媒体缓存；详情重绘不能反复创建Image并触发下一轮onload。
-  const modImages=createModImages(()=>{if(destroyed)return;paintTiles();if(panel==='detail')renderPanel();});
+  const modImages=createModImages(()=>{if(destroyed)return;tileAssetVersion++;paintTiles();if(panel==='detail')renderPanel();});
   const dispose=[];
   const cardById=id=>state.save?.cards.find(c=>c.id===id);
   const configured=()=>!!state.configStatus?.configured;
   const canAccess=()=>!!state.save&&(configured()||localAccess||state.canRetrySave||state.pendingBlocked);
-  const selectionLocked=()=>!!state.busy||presentationBusy||!!state.canRetrySave||!!state.pendingBlocked;
+  const selectionLocked=()=>!!state.canRetrySave||!!state.pendingBlocked||(state.canCombine===undefined?(!!state.busy||presentationBusy):!state.canCombine);
   // 请求及待存只占用本次材料；管理操作、损坏档与弹层仍阻止台面改动。
   const boardLocked=()=>homeActive||!canAccess()||!!state.pendingBlocked||!!state.recoveryRequired||apiOpen||!!panel||!modalLayer.hidden||(!!state.busy&&!['combine','save','cancel'].includes(state.busy));
   const hasProgress=()=>!!state.save&&(state.save.stats.synthesisCount>0||state.save.recipes.length>0||state.save.cards.some(card=>!card.isBase));
@@ -90,7 +92,7 @@ export function createAppView(root, callbacks = {}) {
   // 取卡由画布在实际取出时发声；其余按钮在动作前统一播放点击声，避免一次点击双响。
   shell.addEventListener('click',event=>{const target=event.target.closest?.('button');if(target&&!target.disabled&&!target.matches('.wx-card-tile,.wx-record-card'))factory?.playClick();},{capture:true});
 
-  // 按设计高度 540 缩放整套排版，画布输入再换算回设计坐标。
+  // 与旧版一样按设计高度 540 缩放整套排版，画布输入再换算回设计坐标。
   function fitLayout(){
     const rect=root.getBoundingClientRect(),height=Math.max(1,rect.height),width=Math.max(1,rect.width);
     uiScale=height/540;logicalWidth=width/uiScale;
@@ -113,8 +115,10 @@ export function createAppView(root, callbacks = {}) {
     onCombine(ids){if(ensureRecipeAccess(ids))invoke('onCombine',ids);},
     onPresentationBusy(value){presentationBusy=value;updateSelectionLocks();},
     onReveal(result){
-      if(destroyed||state.synthesis?.id!==result.operationId)return;
-      revealedId=result.operationId;pendingSlots=null;
+      if(destroyed)return;
+      const task=state.syntheses?.find(item=>item.id===result.operationId)||state.synthesis;
+      if(task?.id!==result.operationId)return;
+      revealedId=result.operationId;submittedSelections.delete(result.operationId);
       // 可见反馈在结果卡附近完成；这里只给读屏器保留一次揭晓通知。
       setText(resultStatus,(result.isNewCard?'发现新卡：':'合成完成：')+result.card.name);
     },
@@ -128,26 +132,28 @@ export function createAppView(root, callbacks = {}) {
     },
   });
   const resize=new ResizeObserver(()=>{fitLayout();paintTiles();});resize.observe(root);dispose.push(()=>resize.disconnect());
-  function refreshCanvas(){tidy.disabled=boardLocked();factory.update({save:state.save,saveEpoch:state.saveEpoch,busy:state.busy,selectedIds:selected,lastResult:state.lastResult,synthesis:state.synthesis,enabled:!boardLocked()});}
+  function refreshCanvas(){tidy.disabled=boardLocked();factory.update({save:state.save,saveEpoch:state.saveEpoch,busy:state.busy,selectedIds:selected,lastResult:state.lastResult,synthesis:state.synthesis,syntheses:state.syntheses,canCombine:state.canCombine,enabled:!boardLocked()});}
   function showMessage(text){setText(toast,text);toast.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>{toast.hidden=true;},2600);}
   function openDetail(id){if(!cardById(id))return;detailId=id;share=false;panel='detail';renderPanel();}
   function addIngredient(id){
     if(!canAccess()||selectionLocked()||!cardById(id))return false;
     if(selected.length>=4){showMessage('最多放入四张材料。');return false;}
-    selected.push(id);dockOpen=true;updateSelection();return true;
+    selected.push(id);selectionVersion++;dockOpen=true;updateSelection();return true;
   }
   function ensureRecipeAccess(ids){
     if(!state.save||state.pendingBlocked)return false;
+    const key=JSON.stringify([...ids].sort());
+    if(state.syntheses?.some(task=>!['failed','cancelled','committed'].includes(task.phase)&&JSON.stringify([...task.ingredientIds].sort())===key)){showMessage('这组材料正在合成。');return false;}
     if(configured()||findRecipe(state.save,ids)||state.save.mods?.some(mod=>mod.enabled))return true;
     apiOpen=true;renderApi();refreshCanvas();return false;
   }
   function combineSelected(){
-    if(selected.length<2||state.busy||presentationBusy||state.canRetrySave||!canAccess())return;
+    if(selected.length<2||selectionLocked()||!canAccess())return;
     if(!ensureRecipeAccess(selected))return;
     const ids=selected.slice(),rect=canvas.getBoundingClientRect(),w=canvas.clientWidth||rect.width,h=canvas.clientHeight||rect.height;
     const points=[...tray.children].slice(0,ids.length).map(slot=>{const r=slot.getBoundingClientRect();return {x:(r.left+r.width/2-rect.left)*w/rect.width,y:(r.top+r.height/2-rect.top)*h/rect.height};});
     if(!factory.prepareSynthesis(ids,points))return;
-    pendingSlots={id:null,ids};selected=[];updateSelection();invoke('onCombine',ids);
+    pendingSlots={id:null,ids,version:++selectionVersion};selected=[];updateSelection();invoke('onCombine',ids);
   }
   function updateSelectionLocks(){
     combine.disabled=selected.length<2||selectionLocked()||!canAccess();
@@ -159,7 +165,7 @@ export function createAppView(root, callbacks = {}) {
     canvas.setAttribute('aria-label',picking?'合成工作台：点卡加入多卡合成台，拖叠两张卡合成':'合成工作台：拖叠两张卡合成，点卡查看详情');
     tray.replaceChildren();
     for(let i=0;i<4;i++){
-      const card=cardById(selected[i]),slot=button('',()=>{if(card&&!selectionLocked()){selected.splice(i,1);updateSelection();}},'wx-material-slot'+(card?' wx-filled':''));
+      const card=cardById(selected[i]),slot=button('',()=>{if(card&&!selectionLocked()){selected.splice(i,1);selectionVersion++;updateSelection();}},'wx-material-slot'+(card?' wx-filled':''));
       if(card){slot.append(el('span','wx-slot-emoji',card.emoji),el('span','wx-slot-name',card.name),el('span','wx-slot-remove','×'));slot.setAttribute('aria-label','移除材料：'+card.name);}
       else {setText(slot,'＋');slot.disabled=true;slot.setAttribute('aria-label','空材料格');}
       tray.append(slot);
@@ -173,6 +179,37 @@ export function createAppView(root, callbacks = {}) {
     if(!group){group={id:'default',name:'收藏',cardIds:[]};groups.push(group);}
     if(favoriteIds().has(id))groups.forEach(g=>g.cardIds=g.cardIds.filter(v=>v!==id));else group.cardIds.push(id);
     invoke('onSaveFavorites',groups);
+  }
+  function renderProgress(){
+    const tasks=state.syntheses?.filter(task=>!['failed','cancelled','committed'].includes(task.phase))||[];
+    if(!tasks.length){
+      clearInterval(taskClock);taskClock=null;
+      progress.replaceChildren(el('span','wx-spinner'),progressText,cancel);
+      progress.style.flexDirection='';progress.style.alignItems='';progress.style.whiteSpace='';progress.style.width='';progress.style.maxHeight='';progress.style.overflowY='';
+      progress.hidden=!state.busy||state.busy==='configure';
+      setText(progressText,({save:'正在保存…',cancel:'正在取消…',import:'正在导入存档…',export:'正在导出存档…',backups:'正在读取备份…',restore:'正在恢复存档…',library:'正在读取存档列表…','create-slot':'正在创建存档…','switch-slot':'正在切换存档…','rename-slot':'正在保存名称…','mod-import':'正在读取 Mod…','mod-save':'正在保存 Mod…','mod-action':'正在运行 Mod 玩法…'})[state.busy]||'正在生成新配方…');
+      cancel.hidden=state.busy!=='combine';return;
+    }
+    progress.hidden=false;progress.replaceChildren();
+    Object.assign(progress.style,{flexDirection:'column',alignItems:'stretch',whiteSpace:'normal',width:'min(300px, calc(100% - 36px))',maxHeight:'42%',overflowY:'auto'});
+    for(const task of tasks){
+      const row=el('div','wx-synthesis-task');row.dataset.operationId=task.id;
+      Object.assign(row.style,{display:'flex',alignItems:'center',gap:'8px'});
+      const description=el('div');description.style.flex='1';description.style.minWidth='0';
+      const names=task.ingredientIds.map(id=>cardById(id)?.name||'材料').join(' + ');
+      const heading=el('div','',names),phase=el('span','wx-task-phase',task.phase==='queued'?'等待保存':task.phase==='save-failed'?'结果待保存':task.phase==='saving'?'正在保存':task.source==='mod'?'正在合成':'生成中');
+      heading.style.overflowWrap='anywhere';phase.style.color='var(--muted,#8a93a0)';
+      description.append(heading,phase);
+      if(task.phase==='requesting'){
+        const elapsed=el('span','wx-task-elapsed');elapsed.dataset.startedAt=String(task.startedAt||Date.now());description.append(elapsed);
+      }
+      row.append(description);
+      if(task.phase==='save-failed')row.append(button('重试保存',()=>invoke('onRetrySave',task.id),'wx-small-button'));
+      else if(task.phase==='requesting')row.append(button('取消',()=>invoke('onCancel',task.id),'wx-button-quiet'));
+      progress.append(row);
+    }
+    const tick=()=>{for(const node of progress.querySelectorAll('.wx-task-elapsed'))setText(node,' · '+Math.max(0,Math.floor((Date.now()-Number(node.dataset.startedAt))/1000))+'秒');};
+    tick();if(!taskClock)taskClock=setInterval(tick,1000);
   }
   function renderMenu(){
     menu.replaceChildren();menu.hidden=!menuOpen;
@@ -222,12 +259,20 @@ export function createAppView(root, callbacks = {}) {
   }
   function paintTiles(){
     const pixels=Math.min(window.devicePixelRatio||1,2)*uiScale;
+    const skin=state.save?.preferences.skinId;
+    if(tileMods!==state.save?.mods||tileSkin!==skin){
+      tileMods=state.save?.mods;tileSkin=skin;
+      tileAppearance=skin?.startsWith('mod/')?JSON.stringify(listModAppearances(tileMods||[],'skins').find(item=>item.id===skin)):'';
+    }
     for(const picture of shell.querySelectorAll('.wx-tile-art')){
       const card=cardById(picture.dataset.cardId);if(!card)continue;
       const w=picture.clientWidth||58,h=picture.clientHeight||58;
+      const signature=JSON.stringify([card.id,card.name,card.emoji,card.category,skin,tileAppearance,tileAssetVersion,w,h,pixels]);
+      if(tilePaints.get(picture)===signature)continue;
       picture.width=Math.max(1,Math.round(w*pixels));picture.height=Math.max(1,Math.round(h*pixels));
       const ctx=picture.getContext('2d');ctx.setTransform(pixels,0,0,pixels,0,0);
-      createCardPainter(ctx,{getMods:()=>state.save?.mods||[],images:modImages}).drawTile(2,2,w-4,h-5,card,{skinId:state.save.preferences.skinId,animate:false,now:0});
+      createCardPainter(ctx,{getMods:()=>state.save?.mods||[],images:modImages}).drawTile(2,2,w-4,h-5,card,{skinId:skin,animate:false,now:0});
+      tilePaints.set(picture,signature);
     }
   }
   function renderFavorites(){
@@ -332,8 +377,8 @@ export function createAppView(root, callbacks = {}) {
         entries.push({id:`${mod.manifest.id}:${index}`,ingredientIds,ingredientNames:recipe.ingredients,resultId:result?.id,resultName:recipe.result,resultCategory:definition?.category,at:null,source:{kind:'mod',modId:mod.manifest.id,modName:mod.manifest.name},discovery:'preset'});
       }
     }
-    function putCard(id){if(state.busy||state.canRetrySave||!canAccess()||!cards.has(id))return;panel=null;renderPanel();factory.addCard(id);}
-    function cardButton(id,name){const card=cards.get(id),b=button(card?`${card.emoji} ${card.name}`:name||'未知卡牌',()=>putCard(id),'wx-record-card');b.disabled=!card||!!state.busy||!!state.canRetrySave;b.setAttribute('aria-label',card?`${card.name}，放回台面`:(name||'未知卡牌')+'，尚未发现');return b;}
+    function putCard(id){if((state.busy&&!['combine','save','cancel'].includes(state.busy))||state.canRetrySave||state.pendingBlocked||!canAccess()||!cards.has(id))return;panel=null;renderPanel();factory.addCard(id);}
+    function cardButton(id,name){const card=cards.get(id),b=button(card?`${card.emoji} ${card.name}`:name||'未知卡牌',()=>putCard(id),'wx-record-card');b.disabled=!card||(!!state.busy&&!['combine','save','cancel'].includes(state.busy))||!!state.canRetrySave||!!state.pendingBlocked;b.setAttribute('aria-label',card?`${card.name}，放回台面`:(name||'未知卡牌')+'，尚未发现');return b;}
     function drawRows(){
       results.replaceChildren();const search=recordQuery.normalize('NFKC').trim().toLocaleLowerCase();
       const filtered=entries.filter(entry=>{const card=cards.get(entry.resultId),names=[...(entry.ingredientNames||entry.ingredientIds.map(id=>cards.get(id)?.name||'')),entry.resultName||card?.name||''];return(!recordSource||entry.source.kind===recordSource)&&(!recordCategory||(card?.category||entry.resultCategory)===recordCategory)&&(history||!recordDiscovery||entry.discovery===recordDiscovery)&&(!search||names.some(name=>name.normalize('NFKC').toLocaleLowerCase().includes(search)));});
@@ -407,7 +452,7 @@ export function createAppView(root, callbacks = {}) {
     if(!card.isBase&&card.discoveredAt){const date=new Date(card.discoveredAt);if(!Number.isNaN(date.getTime()))display.append(el('p','wx-subtle','发现于 '+date.toLocaleDateString('zh-CN')));}
     aside.append(display);
     const actions=el('div','wx-action-row'),add=button('加入合成台',()=>{if(addIngredient(card.id)){panel=null;renderPanel();}},'wx-add-ingredient');
-    add.disabled=!!state.busy||presentationBusy||!!state.canRetrySave;
+    add.disabled=selectionLocked();
     actions.append(add,button('查看分享',()=>{share=true;renderPanel();}),button(favoriteIds().has(card.id)?'取消收藏':'收藏',()=>toggleFavorite(card.id),'wx-favorite-action'));aside.append(actions);
     if(!share){const recipes=(state.save.recipes||[]).filter(r=>r.resultId===card.id),box=el('section','wx-settings-section');box.append(el('h3','','已知配方'));
       if(!recipes.length)box.append(el('p','wx-subtle',card.isBase?'本源是探索的起点。':'还没有记录获得它的配方。'));
@@ -512,11 +557,20 @@ export function createAppView(root, callbacks = {}) {
   return {
     render(next){
       if(destroyed)return;state={...state,...next,configStatus:{...state.configStatus,...next.configStatus}};
-      if(saveEpoch!==(state.saveEpoch||0)){saveEpoch=state.saveEpoch||0;pendingSlots=null;selected=[];revealedId=null;restoreSelection=null;renameId=null;newSlotName='';localAccess=false;recordPage=0;modEnableId=null;modRemoveId=null;modImages.clear();}
+      if(saveEpoch!==(state.saveEpoch||0)){saveEpoch=state.saveEpoch||0;pendingSlots=null;submittedSelections.clear();selectionVersion++;selected=[];revealedId=null;restoreSelection=null;renameId=null;newSlotName='';localAccess=false;recordPage=0;modEnableId=null;modRemoveId=null;modImages.clear();}
       // 合成槽保留原顺序和重复材料，取消/失败不让玩家重新点一遍。
       if(pendingSlots&&state.synthesis){
         pendingSlots.id ||= state.synthesis.id;
-        if(pendingSlots.id===state.synthesis.id&&['failed','cancelled'].includes(state.synthesis.phase)){selected=pendingSlots.ids.slice();pendingSlots=null;dockOpen=true;}
+        submittedSelections.set(pendingSlots.id,pendingSlots);pendingSlots=null;
+      }
+      const tasks=state.syntheses||(state.synthesis?[state.synthesis]:[]);
+      for(const task of tasks){
+        const submitted=submittedSelections.get(task.id);
+        if(submitted&&['failed','cancelled'].includes(task.phase)){
+          // 失败只恢复尚未继续编辑的那组材料，不能覆盖玩家已经选好的下一次合成。
+          if(!selected.length&&selectionVersion===submitted.version){selected=submitted.ids.slice();selectionVersion++;dockOpen=true;}
+          submittedSelections.delete(task.id);
+        }
       }
       if(!state.lastResult||state.lastResult.operationId!==revealedId)setText(resultStatus,'');
       if(configured()&&!lastConfigured){apiOpen=false;key.value='';}lastConfigured=configured();
@@ -525,8 +579,8 @@ export function createAppView(root, callbacks = {}) {
       if(state.canRetrySave||state.pendingBlocked||state.recoveryRequired||state.synthesis?.phase==='saving')homeActive=false;
       stats.replaceChildren(el('span','wx-hud-segment','⚒ '+count+' 次'),el('span','wx-hud-segment','✦ '+discoveries+' 张'));stats.setAttribute('aria-label','合成 '+count+' 次，发现 '+discoveries+' 张');
       more.disabled=dictToggle.disabled=favoriteToggle.disabled=launch.disabled=!canAccess();
-      progress.hidden=!state.busy||state.busy==='configure';setText(progressText,({save:'正在保存…',cancel:'正在取消…',import:'正在导入存档…',export:'正在导出存档…',backups:'正在读取备份…',restore:'正在恢复存档…',library:'正在读取存档列表…','create-slot':'正在创建存档…','switch-slot':'正在切换存档…','rename-slot':'正在保存名称…','mod-import':'正在读取 Mod…','mod-save':'正在保存 Mod…','mod-action':'正在运行 Mod 玩法…'})[state.busy]||(state.synthesis?.source==='mod'?'正在运行 Mod…':'正在生成新配方…'));cancel.hidden=state.busy!=='combine';
-      setText(errorText,state.error||(state.canRetrySave?'结果还没有保存，请重试保存。':''));retry.hidden=!state.canRetrySave;selected=selected.filter(id=>cardById(id));updateSelection();
+      renderProgress();
+      setText(errorText,state.error||(state.canRetrySave?'结果还没有保存，请重试保存。':''));retry.hidden=!state.canRetrySave||!!state.syntheses?.some(task=>task.phase==='save-failed');selected=selected.filter(id=>cardById(id));updateSelection();
       const signature=JSON.stringify([state.save?.id,state.saveEpoch,state.save?.cards.length,state.save?.preferences.skinId,state.save?.favorites]);
       if(signature!==listSignature){listSignature=signature;renderLibrary();}
       if(signature!==favoritesSignature){favoritesSignature=signature;renderFavorites();}
@@ -537,7 +591,7 @@ export function createAppView(root, callbacks = {}) {
     clearApiKey(){key.value='';},
     openSettings(){if(canAccess()){panel='settings';renderPanel();}},
     showMessage,
-    destroy(){destroyed=true;clearTimeout(toastTimer);home.destroy();modImages.clear();factory.destroy();dispose.forEach(fn=>fn());key.value='';root.replaceChildren();root.classList.remove('wxgc3');},
+    destroy(){destroyed=true;clearTimeout(toastTimer);clearInterval(taskClock);home.destroy();modImages.clear();factory.destroy();dispose.forEach(fn=>fn());key.value='';root.replaceChildren();root.classList.remove('wxgc3');},
   };
 }
 

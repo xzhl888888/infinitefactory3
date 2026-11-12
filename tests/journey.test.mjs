@@ -46,7 +46,7 @@ async function game(initial=null,configured=false){
   };
 }
 
-test('首次检测→选材→等待→提交揭晓→详情→导出→无Key重开与缓存合成',async()=>{
+test('真实前端闭环：首次检测→选材→等待→提交揭晓→详情→导出→无Key重开与缓存合成',async()=>{
   let snapshot;
   const first=await game();try{
     assert.equal(first.disk.cards.length,5);assert.equal(first.disk.recipes.length,0);

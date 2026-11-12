@@ -1,6 +1,6 @@
 {
   "name": "infinite-factory-3",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "description": "无限工厂3：玩家自带模型配置的本地合卡游戏",

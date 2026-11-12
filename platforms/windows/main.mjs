@@ -14,7 +14,7 @@ const origin = 'wxgc://game';
 const page = `${origin}/index.html`;
 const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self'; worker-src blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg', '.woff2': 'font/woff2' };
-let window, service, activeRequest = false, fileDialog = false, quitting = false;
+let window, service, activeRequest = 0, configuring = false, fileDialog = false, quitting = false;
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'wxgc', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }]);
 app.setName('无限工厂3');
@@ -113,15 +113,21 @@ async function command(name, args) {
     case 'initialize_save': return service.initialize(args.save, args.slotId);
     case 'save_snapshot': return service.save(args.save, args.expectedRevision, args.slotId);
     case 'config_status': return service.configStatus(args.slotId);
-    case 'configure_ai':
-    case 'generate_card': {
+    case 'configure_ai': {
       if (activeRequest || fileDialog) throw Object.assign(Error(), { code: 'BUSY' });
-      activeRequest = true;
-      try { return await (name === 'configure_ai' ? service.configure(args.config, args.slotId) : service.generate(args)); }
-      finally { activeRequest = false; }
+      activeRequest++; configuring = true;
+      try { return await service.configure(args.config, args.slotId); }
+      finally { activeRequest--; configuring = false; }
     }
-    case 'cancel_request': service.cancel(args.slotId); return null;
-    case 'load_pending': return service.loadPending(args.slotId);
+    case 'generate_card': {
+      if (configuring || fileDialog) throw Object.assign(Error(), { code: 'BUSY' });
+      activeRequest++;
+      try { return await service.generate(args); }
+      finally { activeRequest--; }
+    }
+    case 'cancel_request': service.cancel(args.slotId, args.operationId); return null;
+    case 'load_pending': return service.loadPending(args.slotId, args.operationId);
+    case 'list_pending': return service.listPending(args.slotId);
     case 'stage_mod_result': return service.stageModResult(args);
     case 'update_pending': return service.updatePending(args);
     case 'recovery_status': return service.recoveryStatus(args.slotId);

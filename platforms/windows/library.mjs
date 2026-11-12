@@ -43,7 +43,7 @@ export function createLibrary(options) {
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) fail('STORAGE_ERROR');
   const registryFile = path.join(dataDir, 'library.json'), markerFile = path.join(dataDir, 'library.created');
   const slotsDir = path.join(dataDir, 'slots'), services = new Map();
-  let registry = null, registryText = null, registryError = null, busy = 0, activeService = null;
+  let registry = null, registryText = null, registryError = null, busy = 0, activeService = null, configuring = false;
   function readRegistry() {
     const fd = fs.openSync(registryFile, 'r');
     try { const size = fs.fstatSync(fd).size; if (size > REGISTRY_BYTES) fail('LIBRARY_CORRUPT'); return fs.readFileSync(fd, 'utf8'); }
@@ -115,9 +115,17 @@ export function createLibrary(options) {
     } catch (error) { service.close(); throw error; }
   }
   async function request(slotId, method, value) {
-    const slot = scoped(slotId); if (busy) fail('BUSY');
+    const slot = scoped(slotId);
+    if (configuring || (method === 'configure' && busy)) fail('BUSY');
+    if (method === 'configure' && serviceFor(slot).loadPending()) fail('PENDING_SAVE_REQUIRED');
     const service = serviceFor(method === 'configure' ? locate('legacy') : slot); busy++; activeService = service;
-    try { return await service[method](value); } finally { busy--; if (activeService === service) activeService = null; }
+    if (method === 'configure') configuring = true;
+    try { return await service[method](value); }
+    finally {
+      busy--;
+      if (method === 'configure') configuring = false;
+      if (!busy && activeService === service) activeService = null;
+    }
   }
   const library = {
     assertSlot(slotId) { scoped(slotId); },
@@ -139,10 +147,11 @@ export function createLibrary(options) {
     async configStatus(slotId) { scoped(slotId); return serviceFor(locate('legacy')).configStatus(); },
     configure(config, slotId) { return request(slotId, 'configure', config); },
     generate(args) { scoped(args?.slotId); return request(args.slotId, 'generate', args); },
-    cancel(slotId) { scoped(slotId); activeService?.cancel(); },
-    loadPending(slotId) { return serviceFor(scoped(slotId)).loadPending(); },
-    stageModResult(args) { const slot = scoped(args?.slotId); if (busy) fail('BUSY'); return serviceFor(slot).stageModResult(args); },
-    updatePending(args) { const slot = scoped(args?.slotId); if (busy) fail('BUSY'); return serviceFor(slot).updatePending(args); },
+    cancel(slotId, operationId) { scoped(slotId); activeService?.cancel(operationId); },
+    loadPending(slotId, operationId) { return serviceFor(scoped(slotId)).loadPending(operationId); },
+    listPending(slotId) { return serviceFor(scoped(slotId)).listPending(); },
+    stageModResult(args) { const slot = scoped(args?.slotId); if (configuring) fail('BUSY'); return serviceFor(slot).stageModResult(args); },
+    updatePending(args) { const slot = scoped(args?.slotId); if (configuring) fail('BUSY'); return serviceFor(slot).updatePending(args); },
     exportJSON(slotId) { const slot = scoped(slotId); const save = serviceFor(slot).load(); if (!save) fail('STORAGE_ERROR'); return serializeSave(named(save, slot)); },
     // 显式恢复当前槽使用本方法；普通“导入存档”在窗口层调用importAsSlot。
     importSave(save, slotId) { const slot = scoped(slotId); if (busy) fail('BUSY'); return named(serviceFor(slot).importSave(named(typeof save === 'string' ? parseSave(save) : save, slot)), slot); },

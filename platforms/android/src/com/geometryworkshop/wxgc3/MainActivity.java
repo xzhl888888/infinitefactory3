@@ -22,21 +22,36 @@ import java.util.concurrent.*;
 public final class MainActivity extends Activity {
     private static final String ORIGIN="https://appassets.androidplatform.net";
     private static final String CSP="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self'; connect-src 'none'; frame-src 'none'; child-src 'none'; worker-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'";
-    private static final Set<String> COMMANDS=new HashSet<>(Arrays.asList("usage_notice","exit_game","load_save","initialize_save","save_snapshot","config_status","configure_ai","generate_card","cancel_request","export_save_file","choose_import_file","confirm_import","import_save","load_pending","recovery_status","list_backups","restore_backup","library_status","create_slot","switch_slot","rename_slot","import_as_slot","stage_mod_result","update_pending","choose_mod_file"));
+    private static final Set<String> COMMANDS=new HashSet<>(Arrays.asList("usage_notice","exit_game","load_save","initialize_save","save_snapshot","config_status","configure_ai","generate_card","cancel_request","export_save_file","choose_import_file","confirm_import","import_save","load_pending","list_pending","recovery_status","list_backups","restore_backup","library_status","create_slot","switch_slot","rename_slot","import_as_slot","stage_mod_result","update_pending","choose_mod_file"));
     private static final Set<String> MUTATIONS=new HashSet<>(Arrays.asList("initialize_save","save_snapshot","configure_ai","generate_card","import_save","restore_backup","create_slot","switch_slot","rename_slot","import_as_slot","stage_mod_result","update_pending"));
+    private static final Set<String> EXCLUSIVE_MUTATIONS=new HashSet<>(Arrays.asList("initialize_save","configure_ai","import_save","restore_backup","create_slot","switch_slot","rename_slot","import_as_slot"));
+    private static final int GENERATION_LIMIT = 4;
     private static final int EXPORT=301,IMPORT=302,MOD_IMPORT=303;
     private final ExecutorService work=Executors.newSingleThreadExecutor();
+    private final ExecutorService network=new ThreadPoolExecutor(GENERATION_LIMIT,GENERATION_LIMIT,0L,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>()) {
+        @Override protected void terminated() {
+            // 所有网络回调离开后再关库，已收到的答案仍可完成一次原子落盘。
+            work.execute(() -> {if(library!=null)library.close();if(ai!=null)ai.close();});
+            work.shutdown();
+        }
+    };
     private final Object requestLock=new Object();
     private WebView web;
     private SaveCodec codec;
-    private GameLibrary library;
+    private volatile GameLibrary library;
     private SecretVault vault;
     private AiClient ai;
     private AiClient.Request activeRequest;
+    private final Map<String,Generation> generations = new LinkedHashMap<>();
     private volatile boolean destroyed;
     private Object fileRequestId;
     private byte[] exportBytes;
     private volatile boolean dialogActive;
+    private static final class Generation {
+        final String recipeKey;
+        final AiClient.Request request = new AiClient.Request();
+        Generation(String recipeKey) { this.recipeKey=recipeKey;request.preserveResult=true; }
+    }
 
     @Override public void onCreate(Bundle state){
         super.onCreate(state);
@@ -56,9 +71,25 @@ public final class MainActivity extends Activity {
             @Override public void onPageStarted(WebView view,String url,android.graphics.Bitmap icon){if(!entry(Uri.parse(url))){view.removeJavascriptInterface("wxgcAndroid");view.stopLoading();}}
             @Override public void onReceivedSslError(WebView view,android.webkit.SslErrorHandler handler,android.net.http.SslError error){handler.cancel();}
         });
-        web.addJavascriptInterface(new Bridge(),"wxgcAndroid");setContentView(web);
-        // Android 15/16强制边到边；给游戏可用区域加系统安全边距，键盘由adjustResize处理。
-        web.setOnApplyWindowInsetsListener((view,insets)->{if(android.os.Build.VERSION.SDK_INT>=30){android.graphics.Insets bars=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout());view.setPadding(bars.left,bars.top,bars.right,bars.bottom);}else view.setPadding(insets.getSystemWindowInsetLeft(),insets.getSystemWindowInsetTop(),insets.getSystemWindowInsetRight(),insets.getSystemWindowInsetBottom());return insets;});
+        web.addJavascriptInterface(new Bridge(),"wxgcAndroid");
+        // WebView 的内边距不会缩小网页视口，由外层布局为系统栏和刘海预留空间。
+        android.widget.FrameLayout viewport = new android.widget.FrameLayout(this);
+        viewport.setBackgroundColor(0xfff3e9d7);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        viewport.addView(web, new android.widget.FrameLayout.LayoutParams(-1,-1));
+        setContentView(viewport);
+        // Android 15/16强制边到边；由外层布局为系统栏和软键盘预留区域。
+        viewport.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                viewport.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime.bottom));
+            } else {
+                viewport.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            }
+            return insets;
+        });
         web.loadUrl(ORIGIN+"/index.html");
     }
     private boolean local(Uri uri){return "https".equals(uri.getScheme())&&"appassets.androidplatform.net".equals(uri.getHost())&&(uri.getPort()==-1||uri.getPort()==443)&&uri.getUserInfo()==null&&uri.getQuery()==null;}
@@ -80,15 +111,95 @@ public final class MainActivity extends Activity {
             Object id=null;
             try{
                 Fault.require(!destroyed,"CANCELLED");Fault.require(text!=null&&text.getBytes(StandardCharsets.UTF_8).length<=SaveCodec.MAX_BYTES+4096,"SAVE_TOO_LARGE");JSONObject message=SaveCodec.parse(text,SaveCodec.MAX_BYTES+4096);id=message.opt("id");Fault.require(id instanceof String&&((String)id).matches("[A-Za-z0-9._:-]{1,128}"),"INVALID_CONFIG");String command=SaveCodec.str(message.opt("command"));Fault.require(COMMANDS.contains(command),"INVALID_CONFIG");JSONObject args=message.isNull("args")?new JSONObject():SaveCodec.obj(message.opt("args"));final Object requestId=id;
-                if("cancel_request".equals(command)){library.assertActive(args.opt("slotId"));synchronized(requestLock){if(activeRequest!=null)activeRequest.cancel();}work.execute(()->respond(requestId,true,null));return;}
+                if ("cancel_request".equals(command)) {
+                    ensureLibrary().assertActive(args.opt("slotId"));
+                    synchronized (requestLock) {
+                        if (!args.isNull("operationId")) {
+                            Generation generation = generations.get(operationId(args));
+                            if (generation != null) generation.request.cancel();
+                        } else {
+                            if (activeRequest != null) activeRequest.cancel();
+                            for (Generation generation : generations.values()) generation.request.cancel();
+                        }
+                    }
+                    respond(requestId,true,null);
+                    return;
+                }
+                if ("generate_card".equals(command)) {
+                    startGeneration(requestId,args);
+                    return;
+                }
                 AiClient.Request token=null;
-                synchronized(requestLock){
-                    if(MUTATIONS.contains(command)){Fault.require(activeRequest==null,"BUSY");token=new AiClient.Request();activeRequest=token;}
+                synchronized (requestLock) {
+                    if (MUTATIONS.contains(command)) Fault.require(activeRequest == null,"BUSY");
+                    if (EXCLUSIVE_MUTATIONS.contains(command)) {
+                        Fault.require(generations.isEmpty(),"BUSY");
+                        token = new AiClient.Request();
+                        activeRequest = token;
+                    }
                 }
                 final AiClient.Request request=token;
-                work.execute(()->{Object result=null;String error=null;try{result=execute(requestId,command,args,request);}catch(Fault e){error=e.code;}catch(Exception e){error="STORAGE_ERROR";}finally{if(request!=null)synchronized(requestLock){if(activeRequest==request)activeRequest=null;}}if(result!=Deferred.VALUE||error!=null)respond(requestId,result,error);});
+                work.execute(() -> runCommand(requestId,command,args,request,null));
             }catch(Fault e){if(id!=null)respond(id,null,e.code);}catch(Exception e){if(id!=null)respond(id,null,"INVALID_CONFIG");}
         }
+    }
+    private GameLibrary ensureLibrary() {
+        synchronized (requestLock) {
+            if (library == null) library = new GameLibrary(getNoBackupFilesDir(),codec);
+            return library;
+        }
+    }
+    private static String operationId(JSONObject args) {
+        String id = SaveCodec.id(args.opt("operationId"));
+        Fault.require(id.length() <= 128,"INVALID_ID");
+        return id;
+    }
+    private void startGeneration(Object requestId, JSONObject args) {
+        String operation = operationId(args);
+        String key = SaveCodec.recipeKey(args.opt("ingredientIds"));
+        GameLibrary currentLibrary = ensureLibrary();
+        synchronized (requestLock) {
+            currentLibrary.assertActive(args.opt("slotId"));
+            Fault.require(activeRequest == null && !dialogActive,"BUSY");
+            Generation existing = generations.get(operation);
+            if (existing != null) {
+                Fault.require(existing.recipeKey.equals(key),"OPERATION_CONFLICT");
+                throw new Fault("SYNTHESIS_ALREADY_RUNNING");
+            }
+            for (Generation generation : generations.values()) {
+                Fault.require(!generation.recipeKey.equals(key),"SYNTHESIS_ALREADY_RUNNING");
+            }
+            SlotStorage store = currentLibrary.active(args.opt("slotId"));
+            JSONArray pending = store.listPending();
+            for (int i = 0; i < pending.length(); i++) {
+                JSONObject item = SaveCodec.obj(pending.opt(i));
+                if (!operation.equals(item.opt("operationId"))) {
+                    Fault.require(!key.equals(SaveCodec.recipeKey(item.opt("ingredientIds"))),"SYNTHESIS_ALREADY_RUNNING");
+                }
+            }
+            // 已落盘的同一操作仍可读取；新的请求必须计入尚未提交的结果占用。
+            Fault.require(store.loadPending(operation) != null || generations.size() + pending.length() < GENERATION_LIMIT,"SYNTHESIS_LIMIT");
+            Generation generation = new Generation(key);
+            generations.put(operation,generation);
+            network.execute(() -> runCommand(requestId,"generate_card",args,generation.request,operation));
+        }
+    }
+    private void runCommand(Object id, String command, JSONObject args, AiClient.Request request, String generationId) {
+        Object result = null;
+        String error = null;
+        try {
+            Fault.require(!destroyed,"CANCELLED");
+            if (request != null) request.check();
+            result = execute(id,command,args,request);
+        } catch (Fault e) { error=e.code; }
+        catch (Exception e) { error="STORAGE_ERROR"; }
+        finally {
+            synchronized (requestLock) {
+                if (generationId != null) generations.remove(generationId);
+                if (activeRequest == request) activeRequest=null;
+            }
+        }
+        if (result != Deferred.VALUE || error != null) respond(id,result,error);
     }
     private enum Deferred { VALUE }
     private Object execute(Object id,String command,JSONObject args,AiClient.Request request){
@@ -105,7 +216,7 @@ public final class MainActivity extends Activity {
             return version.equals(new String(PrivateFiles.readAtomic(marker,64,"NOTICE_READ_FAILED"),StandardCharsets.UTF_8));
         }
         // 协议与全机档案无关，拒绝进入时无需打开或初始化玩家的存档。
-        if(library==null)library=new GameLibrary(getNoBackupFilesDir(),codec);
+        ensureLibrary();
         // 库列表用于取得槽令牌；共用设备凭据也必须来自当前页面，不能接受旧槽迟到的配置响应。
         if("library_status".equals(command))return library.status();
         library.assertActive(args.opt("slotId"));
@@ -119,8 +230,15 @@ public final class MainActivity extends Activity {
         switch(command){
             case "load_save":return library.load(args.opt("slotId"));
             case "initialize_save":return library.withName(args.opt("slotId"),store.initialize(library.withName(args.opt("slotId"),SaveCodec.obj(args.opt("save")))));
-            case "save_snapshot":return library.withName(args.opt("slotId"),store.save(library.withName(args.opt("slotId"),SaveCodec.obj(args.opt("save"))),SaveCodec.integer(args.opt("expectedRevision"))));
-            case "load_pending":return store.loadPending();
+            case "save_snapshot":{
+                JSONObject proposed = library.withName(args.opt("slotId"),SaveCodec.obj(args.opt("save")));
+                synchronized (requestLock) {
+                    if (!generations.isEmpty()) Fault.require(SaveCodec.same(store.load().opt("mods"),proposed.opt("mods")),"PENDING_SAVE_REQUIRED");
+                }
+                return library.withName(args.opt("slotId"),store.save(proposed,SaveCodec.integer(args.opt("expectedRevision"))));
+            }
+            case "load_pending":return args.isNull("operationId") ? store.loadPending() : store.loadPending(operationId(args));
+            case "list_pending":return store.listPending();
             case "recovery_status":return library.recoveryStatus(args.opt("slotId"));
             case "list_backups":return store.listBackups();
             case "restore_backup":return library.withName(args.opt("slotId"),store.restore(SaveCodec.str(args.opt("id"))));
@@ -149,8 +267,20 @@ public final class MainActivity extends Activity {
         key=AiClient.validKey(key);JSONObject secret=SaveCodec.record("config",config,"key",key);Fault.require(secret.toString().getBytes(StandardCharsets.UTF_8).length<=8192,"CONFIG_TOO_LARGE");JSONArray sample=new JSONArray(),bases=SaveCodec.arr(codec.catalog.opt("bases"),5);sample.put(bases.opt(0));sample.put(bases.opt(1));ai.generate(config,key,sample,request);request.check();vault.write(secret);return SaveCodec.record("configured",true,"keyAvailable",true,"baseUrl",config.opt("baseUrl"),"model",config.opt("model"));
     }
     private JSONObject generate(JSONObject args,AiClient.Request request,SlotStorage store){
-        JSONArray ids=SaveCodec.arr(args.opt("ingredientIds"),4);String key=SaveCodec.recipeKey(ids),op=SaveCodec.id(args.opt("operationId"));Fault.require(op.length()<=128,"INVALID_ID");JSONObject save=store.load();Fault.require(save!=null,"INVALID_SAVE");JSONObject pending=store.loadPending();if(pending!=null){Fault.require(op.equals(pending.opt("operationId"))&&key.equals(SaveCodec.recipeKey(pending.opt("ingredientIds"))),"BUSY");return SaveCodec.obj(pending.opt("result"));}
+        request.check();
+        JSONArray ids=SaveCodec.arr(args.opt("ingredientIds"),4);String key=SaveCodec.recipeKey(ids),op=operationId(args);
+        JSONObject save=store.load();Fault.require(save!=null,"INVALID_SAVE");
+        JSONObject pending=store.loadPending(op);
+        if(pending!=null){Fault.require(key.equals(SaveCodec.recipeKey(pending.opt("ingredientIds"))),"OPERATION_CONFLICT");return SaveCodec.obj(pending.opt("result"));}
         JSONArray cards=SaveCodec.arr(save.opt("cards"),25000),recipes=SaveCodec.arr(save.opt("recipes"),100000);Map<String,JSONObject> byId=new HashMap<>();for(int i=0;i<cards.length();i++){JSONObject card=SaveCodec.obj(cards.opt(i));byId.put(SaveCodec.str(card.opt("id")),card);}
+        JSONArray committed = SaveCodec.arr(save.opt("operations"),100000);
+        for (int i = 0; i < committed.length(); i++) {
+            JSONObject operation = SaveCodec.obj(committed.opt(i));
+            if (op.equals(operation.opt("id"))) {
+                Fault.require(key.equals(operation.opt("recipeKey")),"OPERATION_CONFLICT");
+                return codec.card(byId.get(operation.opt("resultId")));
+            }
+        }
         JSONArray materials=new JSONArray();for(int i=0;i<ids.length();i++){JSONObject card=byId.get(SaveCodec.id(ids.opt(i)));Fault.require(card!=null,"UNKNOWN_INGREDIENT");materials.put(card);}for(int i=0;i<recipes.length();i++){JSONObject recipe=SaveCodec.obj(recipes.opt(i));if(key.equals(recipe.opt("key"))){JSONObject result=codec.card(byId.get(recipe.opt("resultId")));store.putPending(SaveCodec.record("saveId",save.opt("id"),"operationId",op,"ingredientIds",SaveCodec.parseArray(key),"result",result,"now",SaveCodec.now(),"source",SaveCodec.record("kind","recipe"),"modStates",new JSONArray(),"modProcessed",false));return result;}}
         JSONObject fixed=codec.modCodec.findRecipe(save,ids);if(fixed!=null){JSONObject result=SaveCodec.obj(fixed.opt("result"));store.putPending(SaveCodec.record("saveId",save.opt("id"),"operationId",op,"ingredientIds",SaveCodec.parseArray(key),"result",result,"now",SaveCodec.now(),"source",fixed.opt("source"),"modStates",new JSONArray(),"modProcessed",false));return result;}
         JSONObject secret=vault.read();Fault.require(secret!=null,"KEY_REQUIRED");JSONArray themes=new JSONArray(),mods=SaveCodec.arr(save.opt("mods"),16);for(int i=0;i<mods.length();i++){JSONObject mod=SaveCodec.obj(mods.opt(i));String theme=SaveCodec.str(SaveCodec.obj(mod.opt("manifest")).opt("theme"));if(Boolean.TRUE.equals(mod.opt("enabled"))&&!theme.isEmpty())themes.put(theme);}
@@ -161,7 +291,7 @@ public final class MainActivity extends Activity {
         synchronized(requestLock){request.check();library.assertActive(args.opt("slotId"));store.putPending(record);}return result;
     }
     private JSONObject stageMod(JSONObject args,SlotStorage store,boolean update){
-        JSONObject save=store.load();Fault.require(save!=null,"INVALID_SAVE");String operation=SaveCodec.id(args.opt("operationId"));Fault.require(operation.length()<=128,"INVALID_ID");JSONObject pending=store.loadPending();
+        JSONObject save=store.load();Fault.require(save!=null,"INVALID_SAVE");String operation=operationId(args);JSONObject pending=store.loadPending(operation);
         JSONArray ids=update?(pending==null?null:SaveCodec.arr(pending.opt("ingredientIds"),4)):SaveCodec.arr(args.opt("ingredientIds"),4);Fault.require(ids!=null,"OPERATION_CONFLICT");String key=SaveCodec.recipeKey(ids);if(update)Fault.require(operation.equals(pending.opt("operationId")),"OPERATION_CONFLICT");
         Map<String,JSONObject> cards=SaveCodec.indexed(SaveCodec.arr(save.opt("cards"),25000),"id");for(int i=0;i<ids.length();i++)Fault.require(cards.containsKey(ids.opt(i)),"UNKNOWN_INGREDIENT");JSONArray mods=SaveCodec.arr(save.opt("mods"),16);JSONObject result=codec.card(args.opt("result")),source=codec.modCodec.source(args.opt("source"),mods);JSONArray states=codec.modCodec.states(args.opt("modStates"),mods);
         if(!update)Fault.require("mod".equals(source.opt("kind"))||"recipe".equals(source.opt("kind")),"INVALID_SOURCE");
@@ -187,5 +317,14 @@ public final class MainActivity extends Activity {
         }catch(Fault e){respond(id,null,e.code);}catch(Exception e){respond(id,null,code==EXPORT?"FILE_WRITE_FAILED":"FILE_READ_FAILED");}});
     }
     @Override public void onBackPressed(){if(web!=null)web.evaluateJavascript("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));",null);}
-    @Override protected void onDestroy(){destroyed=true;synchronized(requestLock){if(activeRequest!=null)activeRequest.cancel();}if(web!=null){web.removeJavascriptInterface("wxgcAndroid");web.destroy();web=null;}work.execute(()->{if(library!=null)library.close();if(ai!=null)ai.close();});work.shutdown();super.onDestroy();}
+    @Override protected void onDestroy(){
+        destroyed=true;
+        synchronized(requestLock){
+            if(activeRequest!=null)activeRequest.cancel();
+            for(Generation generation:generations.values())generation.request.cancel();
+        }
+        network.shutdownNow();
+        if(web!=null){web.removeJavascriptInterface("wxgcAndroid");web.destroy();web=null;}
+        super.onDestroy();
+    }
 }
