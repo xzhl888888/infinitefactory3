@@ -26,13 +26,14 @@ async function boot(){
     manager?.open(name);
   };
   manager=createManagementView(management,controller.callbacks,{
-    onModalChange(){},onAddCard:id=>runtime?.addCard(id),
+    onModalChange:covered=>runtime?.setCovered(covered),onAddCard:id=>runtime?.addCard(id),
   });
   bridge=createLegacyBridge(controller,{onOpen,onMessage:text=>manager.showMessage(text),
     isModalOpen:()=>manager.isModalOpen(),canAccess:()=>manager.canAccess()});
   bridge.install(window);bridge.update(controller.state);
   manager.render(controller.state);
   runtime=await createLegacyRuntime(canvas,{bridge,onOpen});
+  runtime.setCovered(manager.isModalOpen());
   runtime.render(controller.state);await runtime.start();
   window.addEventListener('beforeunload',()=>{
     manager.clearApiKey();runtime.destroy();bridge.destroy();manager.destroy();

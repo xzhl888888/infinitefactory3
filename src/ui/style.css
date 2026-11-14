@@ -141,6 +141,48 @@
 
 /* 二代原场景独占整屏绘制和输入；三代管理窗口只在打开时接管输入。 */
 .wx-legacy-canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;user-select:none}
+.wx-legacy-home-backdrop,.wx-legacy-home-falls{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+.wx-legacy-home-backdrop canvas{display:block;width:100%;height:100%}
+.wx-legacy-home-fall,.wx-legacy-home-gold{
+  position:absolute;display:grid;place-items:center;line-height:1;
+  font-family:"Segoe UI Emoji","Apple Color Emoji",system-ui;
+}
+.wx-legacy-home-fall{
+  top:calc(-40px * var(--ui-scale));font-size:calc(var(--drop-size) * var(--ui-scale));
+  margin-inline-start:calc(var(--drop-size) * var(--ui-scale) / -2);
+  animation:wx-legacy-fall linear infinite;
+}
+@keyframes wx-legacy-fall{
+  0%{transform:translate3d(0,0,0)}
+  25%{transform:translate3d(calc(16px * var(--ui-scale)),calc(var(--fall-travel) / 4),0)}
+  50%{transform:translate3d(0,calc(var(--fall-travel) / 2),0)}
+  75%{transform:translate3d(calc(-16px * var(--ui-scale)),calc(var(--fall-travel) * .75),0)}
+  100%{transform:translate3d(0,var(--fall-travel),0)}
+}
+.wx-legacy-home-gold{
+  --gold-size:calc(54px * var(--ui-scale));
+  top:calc(-61px * var(--ui-scale));left:83%;margin-inline-start:calc(var(--gold-size) / -2);
+  width:var(--gold-size);height:var(--gold-size);font-size:var(--gold-size);
+  text-shadow:0 0 calc(16px * var(--ui-scale)) rgba(199,154,62,.75);
+  animation:wx-legacy-gold 34s linear infinite;
+}
+@keyframes wx-legacy-gold{
+  0%{transform:translate3d(0,0,0)}
+  8%{transform:translate3d(calc(18px * var(--ui-scale)),calc(var(--gold-travel) * .32),0)}
+  18%{transform:translate3d(calc(-18px * var(--ui-scale)),calc(var(--gold-travel) * .72),0)}
+  25%,100%{transform:translate3d(0,var(--gold-travel),0)}
+}
+.wx-legacy-home-sweep{
+  position:absolute;left:50%;top:64%;transform:translateX(-50%);overflow:hidden;pointer-events:none;
+}
+.wx-legacy-home-sweep::before{
+  content:"";position:absolute;inset:2% 0;
+  background:linear-gradient(135deg,transparent 36%,rgba(255,255,255,.45) 50%,transparent 64%);
+  animation:wx-legacy-sweep 3.2s linear infinite;
+}
+@keyframes wx-legacy-sweep{0%{transform:translateX(-100%)}28%,100%{transform:translateX(100%)}}
+.wx-legacy-paused .wx-legacy-home-fall,.wx-legacy-paused .wx-legacy-home-gold,
+.wx-legacy-paused .wx-legacy-home-sweep::before{animation-play-state:paused}
 .wx-legacy-management{position:absolute;inset:0;pointer-events:none}
 .wx-management-shell{background:transparent;pointer-events:none}
 .wx-management-shell>.wx-panel-layer,.wx-management-shell>.wx-modal-layer{pointer-events:auto}

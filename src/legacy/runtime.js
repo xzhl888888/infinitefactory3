@@ -14,7 +14,7 @@ export async function createLegacyRuntime(canvas, { bridge, onOpen } = {}) {
   let destroyed = false;
   let lastSlot = null;
   const media = {
-    images: createModImages(),
+    images: createModImages(() => { if (!destroyed) window.WXGC3_LEGACY_ENGINE?.invalidate(); }),
     audio: createModAudio(),
   };
   window.WXGC3_LEGACY_MEDIA = media;
@@ -54,6 +54,7 @@ export async function createLegacyRuntime(canvas, { bridge, onOpen } = {}) {
       if (slot!==lastSlot) { media.audio.clear();media.images.clear();lastSlot=slot; }
       engine.render(state);
     },
+    setCovered(covered) { if (!destroyed) engine.setCovered(covered); },
     addCard(id) {
       if (destroyed) return false;
       if (!window.SCENES?.['工厂界面']?.addCard) return false;

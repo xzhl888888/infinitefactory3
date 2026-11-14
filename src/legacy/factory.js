@@ -25,8 +25,7 @@
     };
   }
 
-
-  let localState=null, localIdentity='', localCardsKey='', localFavoritesKey='', localSkin='', lastLayoutSignature='', externalBlocked=false, localHydrationNeeded=false, lastZoomSaved=null;
+  let localState=null, localIdentity='', localCardsKey='', localFavoritesKey='', localSkin='', lastLayoutSignature='', externalBlocked=false, localHydrationNeeded=false, lastZoomSaved=null, zoomSaveTimer=0;
   const nativeCard=name=>localState&&localState.save&&localState.save.cards.find(card=>card.name===name);
   function localCardData(card,index){
     return {n:card.name,e:card.emoji,cat:card.category,q:card.description,seq:index+1,rar:card.isBase?9:0,
@@ -47,6 +46,7 @@
     const cardsKey=save.cards.map(card=>card.id).join('|'),favoritesKey=JSON.stringify(save.favorites||[]),skin=(save.preferences||{}).skinId||'default';
     st.account={id:save.id,name:save.name};st.accountToken=save.id;PLAYER=save.name||'我的世界';
     if(changed){
+      clearTimeout(zoomSaveTimer); zoomSaveTimer=0;
       clearGestures();st.cards=[];st.slots=[null,null,null,null];st.pending=[];st.effects=[];st.floats=[];
       st.detail=null;st.share=null;st.favPick=null;st.menuOpen=false;st.dictView='mine';st.dictScroll=0;st.favScroll=0;
       st.seen=new Set();st._seeded=false;localIdentity=identity;localCardsKey='';lastLayoutSignature='';lastZoomSaved=null;localHydrationNeeded=true;
@@ -65,6 +65,7 @@
       st._favItemCache=null;_dictCache=null;_dataStamp++;localFavoritesKey=favoritesKey;
     }
     if(localHydrationNeeded&&CUR_NAME==='工厂界面'&&st.PLAY_W>0){loadFactoryCanvas();localHydrationNeeded=false;}
+    if(CUR_NAME==='工厂界面') invalidate();
   }
 
   /* ---------- 世界/视图 ---------- */
@@ -81,10 +82,10 @@
     dictOpen:true, dictT:1, drawerLeft:0, dictContentX:0, dictContentW:0, panelX:0, toggleRect:{x:0,y:0,w:24,h:64},
     favOpen:false, favT:0, favTab:0, favScroll:0, favPan:null, favPick:null, favFolders:null, favQuery:'', favSearchActive:false, _favCells:[], _favMaxScroll:0, _favDrawer:null,
     dictQuery:'', dictCat:'全部', dictLen:0, dictView:'mine', dictScroll:0, dictSearchActive:false, dictPan:null, _dictCells:[], _dictMaxScroll:0, _dictGridTop:0,
-    recentCombines:[], recentCombinesVisible:false,   // 「最近合成」默认隐藏（2026-07-02 用户拍板·点📜最近可打开·选择会记住）
+    recentCombines:[], recentCombinesVisible:false,   // 最近合成默认收起。
     account:null, accountToken:'', owned:new Set(), collectionOwned:new Set(), collectionOwnedAccount:'', myFirsts:new Set(), firstCount:0, canvasLocked:false, photoMode:null, _seeded:false };   // photoMode={phase,hideAt,restoreAt,view}:工厂净屏截图模式（不落盘·离场必恢复）   // account=真账号(HUD)·accountToken=这份账号资料属于哪张登录凭证·owned/myFirsts=我拥有/我首发(来自 me/cards)·collectionOwned=收藏接口按当前账号补齐的拥有态·_seeded=本源是否已铺到画布
   const FAV_STORE='wxgc2_fav_folders_v1';
-  const FACTORY_CANVAS_STORE='wxgc2_factory_canvas_v1', CANVAS_LOCK_STORE='wxgc2_canvas_lock_v1', RECENT_COMBINE_STORE='wxgc2_recent_combines_v1', RECENT_COMBINE_VISIBLE_STORE='wxgc2_recent_combines_visible_v1';
+  const CANVAS_LOCK_STORE='wxgc2_canvas_lock_v1', RECENT_COMBINE_STORE='wxgc2_recent_combines_v1', RECENT_COMBINE_VISIBLE_STORE='wxgc2_recent_combines_visible_v1';
   function loadCanvasLock(){ try{ return localStorage.getItem(CANVAS_LOCK_STORE)==='1'; }catch(_){ return false; } }
   function setCanvasLock(on){
     st.canvasLocked=!!on; st.pan=null; st.pinch=null;
@@ -92,7 +93,13 @@
     toast(st.canvasLocked?'已固定画布缩放和移动':'已解除画布固定');
   }
   function canvasHasContent(){ return !!((st.cards&&st.cards.length)||(st.slots&&st.slots.some(Boolean))); }
-  function saveFactoryCanvas(force){
+  // 台面落点在松手时写入，滚轮连续缩放收成一次保存。
+  function saveZoomSoon(){
+    clearTimeout(zoomSaveTimer);
+    zoomSaveTimer=setTimeout(saveFactoryCanvas,160);
+  }
+  function saveFactoryCanvas(){
+    clearTimeout(zoomSaveTimer); zoomSaveTimer=0;
     if(STILL||!localState||!localState.save||!st._seeded)return;
     const layout=st.cards.map(card=>{
       const known=nativeCard(card.n);if(!known)return null;
@@ -127,7 +134,7 @@
       return card;
     }).filter(Boolean);
     st._seeded=!!((save.preferences||{}).layoutInitialized||st.cards.length);
-    if(!st._seeded&&BASES.length){resetBaseView();seedBases(BASES);st._seeded=true;saveFactoryCanvas(true);}
+    if(!st._seeded&&BASES.length){resetBaseView();seedBases(BASES);st._seeded=true;saveFactoryCanvas();}
     else {view.s=clamp(Number((save.preferences||{}).zoom)||1,Z_MIN,Z_MAX);view.x=st.PLAY_W/2-800*view.s;view.y=st.PLAY_H/2-500*view.s;clampView();}
     return true;
   }
@@ -143,7 +150,7 @@
       const raw=JSON.parse(localStorage.getItem(RECENT_COMBINE_STORE)||'[]');
       st.recentCombines=(Array.isArray(raw)?raw:[]).filter(r=>r&&Array.isArray(r.items)&&r.result&&r.result.n).slice(0,3);
     }catch(_){ st.recentCombines=[]; }
-    try{ st.recentCombinesVisible=localStorage.getItem(RECENT_COMBINE_VISIBLE_STORE)==='1'; }catch(_){ st.recentCombinesVisible=false; }   // 默认隐藏·玩家点过「显示」(存'1')才常显（2026-07-02 用户拍板）
+    try{ st.recentCombinesVisible=localStorage.getItem(RECENT_COMBINE_VISIBLE_STORE)==='1'; }catch(_){ st.recentCombinesVisible=false; }
   }
   function saveRecentCombines(){
     if(STILL) return;
@@ -180,13 +187,12 @@
     keep.forEach(n=>{ if(favFolderOf(n)<0) fs[0].cards.unshift(n); });
     favSave();
   }
-  /* 【性能专项M5】收藏项缓存：原版收藏抽屉开着时每帧对每张收藏卡做两次线性查找（清点热点#2）。
-     缓存按卡名记忆，数据变化（markOwnership/upsertDict）时整体作废。 */
+  /* 按卡名缓存收藏卡片，卡牌数据变动时更新。 */
+
   function favItem(name){
     const fc=st._favItemCache||(st._favItemCache={}); if(fc[name]) return fc[name];
-    // 图标/详情解析链（2026-07-06 加固·修"收藏夹 emoji 全变⭐"）：我的卡 → 公共词典 → 本地词库 → 收藏图标记忆(来自 /me/collections·永远有真图标) → META → 实在没有才⭐
     const mine=(st.myCards||[]).find(d=>d.n===name), dic=DICT.find(d=>d.n===name);
-    const cm=COLL_META[name]||{}, m=META[name]||{}, d=mine||dic||{};   // ld 惰性查·前两者命中就不查（2026-07-06 审查修·性能）
+    const cm=COLL_META[name]||{}, m=META[name]||{}, d=mine||dic||{};
     const e=m.e||d.e||cm.e||'⭐', cat=m.cat||d.cat||cm.cat||'收藏', seq=m.seq||d.seq||cm.seq||0, by=m.byName||m.by||d.byName||d.by||cm.byName||cm.by||'';
     const item=Object.assign({}, d, cm, {n:name,e:e,cat:cat,seq:seq,q:m.q||d.q||cm.q||'',byName:by,by:by,lim:m.lim||cardLim(d)||cm.lim||'',owned:st.owned&&st.owned.has(name),friendShared:!!(cm.friendShared||d.friendShared),providers:(cm.providers||d.providers||[])});
     decorateCard(item,firstFrameOn());
@@ -220,7 +226,6 @@
     const skin=(localState&&localState.save&&localState.save.preferences||{}).skinId;
     return skin&&skin!=='default'?skin:((d&&(d.lim||d.skin||d.card_skin))||'');
   }
-  // 本源/词典在 bootData 拉到后才有·此处不再预填（数据全来自真后端）
 
   /* ---------- 词典搜索：一个看不见的输入框只负责"接键盘/弹手机软键盘"，文字由 Canvas 自己画 ----------
      （小游戏端将来用适配层换成 wx.showKeyboard / tt.showKeyboard，Canvas 渲染逻辑不变） */
@@ -233,32 +238,31 @@
   const DICT_EGGS={ '彩蛋':'别找了，彩蛋才不在词典里~', '厂长':'厂长不就是你嘛！', '无限工厂':'整个工厂可装不进一张卡哦~', '无限工厂2':'整个工厂可装不进一张卡哦~' };
   const _dictEggSeen=new Set();
   function eggDictSearch(q){ q=String(q||'').trim(); const r=DICT_EGGS[q]; if(!r||_dictEggSeen.has(q)) return; _dictEggSeen.add(q); toast(r); }
-  dq.addEventListener('input',()=>{ st.dictQuery=dq.value; st.dictScroll=0; eggDictSearch(dq.value); triggerDictServerSearch(); });   // 公共/个人搜索与分类、字数共用同一组服务器筛选
-  dq.addEventListener('focus',()=>{ st.dictSearchActive=true; });
-  dq.addEventListener('blur',()=>{ st.dictSearchActive=false; });
+  dq.addEventListener('input',()=>{ st.dictQuery=dq.value; st.dictScroll=0; eggDictSearch(dq.value); triggerDictServerSearch(); invalidate(); });
+  dq.addEventListener('focus',()=>{ st.dictSearchActive=true; invalidate(); });
+  dq.addEventListener('blur',()=>{ st.dictSearchActive=false; invalidate(); });
   const fq=document.createElement('input');
   fq.type='text'; fq.maxLength=12;
   fq.setAttribute('autocomplete','off'); fq.setAttribute('autocorrect','off'); fq.setAttribute('autocapitalize','off'); fq.setAttribute('spellcheck','false');
   fq.style.cssText=dq.style.cssText;
   document.body.appendChild(fq); registerInput(fq);
-  fq.addEventListener('input',()=>{ st.favQuery=fq.value; st.favScroll=0; });
-  fq.addEventListener('focus',()=>{ st.favSearchActive=true; });
-  fq.addEventListener('blur',()=>{ st.favSearchActive=false; });
+  fq.addEventListener('input',()=>{ st.favQuery=fq.value; st.favScroll=0; invalidate(); });
+  fq.addEventListener('focus',()=>{ st.favSearchActive=true; invalidate(); });
+  fq.addEventListener('blur',()=>{ st.favSearchActive=false; invalidate(); });
   /* 把隐形输入框对齐到搜索框位置（手机软键盘会贴着它弹），词典没开就挪走防误聚焦 */
   function syncSearchBox(){
-    const r=cvRect(), sxr=r.width/W, syr=r.height/H;   // 【M5】画布位置走引擎缓存·不再每帧强制布局查询
+    const r=cvRect(), sxr=r.width/W, syr=r.height/H;
     const hide=inp=>{ if(document.activeElement===inp) inp.blur(); inp.style.left='-9999px'; };
     if(st.dictOpen && st.dictT>=0.9){
-      dq.style.pointerEvents='auto';   // 【v42修复】切场景收纳后必须恢复可点击——手机上直接点输入框原生弹键盘（玩家反馈：搜索点了没反应）
-      // 【2026-07-05 手机防误触修复】隐形输入框内缩留安全边距·尤其下边多留(IMB)，离下方视图标签(新卡/收藏榜/借用榜…)更远——
-      //   免得手指点标签时触摸范围够到它、误弹键盘(玩家反馈)。仍覆盖搜索框中心大片区域，"点搜索框弹键盘"原功能不受影响。
+      dq.style.pointerEvents='auto';   // 恢复触摸输入，以便在手机上弹出原生键盘。
+      // 输入框收窄，避免遮到相邻的筛选按钮。
       var IMX=4, IMT=3, IMB=8;   // 左右/上/下内缩(逻辑px)
       dq.style.left=(r.left+(st.panelX+8+IMX)*sxr)+'px'; dq.style.top=(r.top+(st.TICK_H+8+IMT)*syr)+'px';
       dq.style.width=((st.DICT_W-16-IMX*2)*sxr)+'px'; dq.style.height=(Math.max(14,(st._dictBoxH||28)-IMT-IMB)*syr)+'px';   // 高度跟随词典大字模式的搜索框·下留 IMB 安全边距·至少 14px 保证可点
     } else hide(dq);
     const fd=st._favDrawer;
     if(fd&&st.favOpen&&st.favT>0.75&&fd.searchX!=null){
-      fq.style.pointerEvents='auto';   // 【v42修复】同上·收藏搜索
+      fq.style.pointerEvents='auto';
       fq.style.left=(r.left+fd.searchX*sxr)+'px'; fq.style.top=(r.top+fd.searchY*syr)+'px';
       fq.style.width=(fd.searchW*sxr)+'px'; fq.style.height=(fd.searchH*syr)+'px';
     } else hide(fq);
@@ -324,7 +328,7 @@
     if(b.prev && inTut(p,b.prev)){ tutGo(-1); return; }
     if(inTut(p,b.next)){ if(b.last) tutClose(); else tutGo(1); return; } }
   function tutDown(p){ _tutDrag={ y:p.y, s:_tutScroll, moved:false }; }
-  function tutMove(p){ if(!_tutDrag) return; if(Math.abs(p.y-_tutDrag.y)>5) _tutDrag.moved=true; _tutScroll=clamp(_tutDrag.s-(p.y-_tutDrag.y),0,_tutMaxScroll); }
+  function tutMove(p){ if(!_tutDrag) return; if(Math.abs(p.y-_tutDrag.y)>5) _tutDrag.moved=true; _tutScroll=clamp(_tutDrag.s-(p.y-_tutDrag.y),0,_tutMaxScroll); return true; }
   function tutUp(p){ if(!_tutDrag) return; var moved=_tutDrag.moved; _tutDrag=null; if(!moved) tutClick(p); }
   function tutWheel(e){ _tutScroll=clamp(_tutScroll+e.deltaY,0,_tutMaxScroll); }
   function tutDraw(t){
@@ -368,10 +372,9 @@
     block(px+pw-22-bw,footY-bh/2,bw,bh,10, GOLD, INK,2.5,3); ctx.fillStyle=INK; ctx.font=B(13); ctx.fillText(last?'完成 ✓':'下一章 ›',px+pw-22-bw/2,footY);
     _tutBtns={ close:{x:clsX-18,y:clsY-18,w:36,h:36}, prev:prevOn?{x:px+22,y:footY-bh/2,w:bw,h:bh}:null, next:{x:px+pw-22-bw,y:footY-bh/2,w:bw,h:bh}, last:last };
     ctx.restore();
+    return el<300?0:Infinity;
   }
 
-  // #1 TapTap 成就实时上报——2026-07-11 已下沉到全局：client.js 的 me() 在必经之路挂钩 __WXGC2_ON_NEW_ACH(处理器在 99-启动.js·弹横幅+报TapTap)·
-  //   任何页面任何 /me 触发的解锁都能报到·治"在工厂以外的页面解锁→newAchievements 被丢弃→TapTap 漏报"。
   //   本场景原 TT_STEP 表 + reportAchievements 已整体搬走·勿在场景内重复处理(横幅会弹两次)。
 
   function computeDictRaw(){
@@ -386,8 +389,8 @@
     }else sortByMyRecent(list);
     return {list,qActive:!!raw,filterActive:dictFacetActive(),serverFilterActive:false,filterLoading:false};
   }
-  /* 【性能专项M5】词典结果缓存：原版每帧全量 filter+sort（清点热点#1·卡越多越卡）。
-     现在只有"视图/分类/搜索词/数据条数/最近顺序/拥有态"任一变化才重算，其余帧直接复用上次结果。 */
+  /* 词典条件和卡牌数据改变时重新计算列表。 */
+
   function computeDict(){ const v=st.dictView;
     const key=v+'|'+st.dictCat+'|'+st.dictLen+'|'+st.dictQuery+'|'+((st.myCards&&st.myCards.length)||0)+'|'+_recentStamp+'|'+_dataStamp;
     if(_dictCache&&_dictCache.key===key) return _dictCache.res;
@@ -449,15 +452,13 @@
     }
     clampView();
   }
-  function seedBases(bases){ const pts=BASE_SEED_POINTS;   // 把后端本源(rar=9)铺到画布·bootData 拉到后调一次
+  function seedBases(bases){ const pts=BASE_SEED_POINTS;
     bases.forEach((b,i)=>{ const p=pts[i%pts.length]; st.cards.push(mk(b.n,b.e,b.cat,'',b.seq||0,p[0],p[1],true,false,b.q,true)); }); }   // 本源都是本季卡
   function worldToScreen(wx,wy){ return {x:view.x+wx*view.s, y:st.TICK_H+view.y+wy*view.s}; }
   function screenToWorld(sx,sy){ return {x:(sx-view.x)/view.s, y:(sy-st.TICK_H-view.y)/view.s}; }
   function clampView(){ const b=worldBounds(), fw=b.w*view.s, fh=b.h*view.s, M=Math.min(180,fw*.5,fh*.5);
     const loX=M-b.maxX*view.s,hiX=st.PLAY_W-M-b.minX*view.s; view.x=loX>hiX?(st.PLAY_W-(b.minX+b.maxX)*view.s)/2:clamp(view.x,loX,hiX);
     const loY=M-b.maxY*view.s,hiY=st.PLAY_H-M-b.minY*view.s; view.y=loY>hiY?(st.PLAY_H-(b.minY+b.maxY)*view.s)/2:clamp(view.y,loY,hiY); }
-
-
 
   /* ---------- 画布(1代背景) ---------- */
   function drawPlay(now,clean){ ctx.save(); ctx.beginPath(); ctx.rect(0,st.TICK_H,st.PLAY_W,st.PLAY_H); ctx.clip();
@@ -500,9 +501,7 @@
       const media=window.WXGC3_LEGACY_MEDIA,image=media&&media.images.get(custom.image);
       if(image){ctx.save();ctx.globalAlpha=.35;ctx.drawImage(image,0,st.TICK_H,st.PLAY_W,st.PLAY_H);ctx.restore();}
     }
-    // 蓝图点阵(随平移移动·工作台质感)【性能专项M5】离屏缓存：像素结果与原版逐点一致，
-    //   只在"缩放/画布尺寸变化"时重画一次点阵（原来平移/静止时每帧数千次 fillRect·清点热点#4），平移=纯位块拷贝。
-    //   深蓝星野下点阵换淡蓝(缓存键带主题·切台面自动重烘)。
+    // 台面尺寸、缩放或主题变化时更新点阵缓存，平移时复用。
     { const step=Math.max(16,28*view.s), oxp=((view.x%step)+step)%step, oyp=((view.y%step)+step)%step;
       let dc=st._dotCache;
       if(!dc||dc.step!==step||dc.pw!==st.PLAY_W||dc.ph!==st.PLAY_H||dc.S!==S||dc.tabletop!==tabletopCacheKey){
@@ -521,12 +520,11 @@
     else if(star){ lg.addColorStop(0,'rgba(170,215,255,.16)'); lg.addColorStop(1,'rgba(170,215,255,0)'); }
     else { lg.addColorStop(0,'rgba(255,252,240,.72)'); lg.addColorStop(1,'rgba(255,252,240,0)'); }
     ctx.fillStyle=lg; ctx.fillRect(0,st.TICK_H,st.PLAY_W,st.PLAY_H);
-    // (造物涟漪圆圈已按用户要求去掉·只留中央柔光)
     // 世界框(细虚线·工坊风·星野下调亮)
     const wb=worldBounds(), tl=worldToScreen(wb.minX,wb.minY), br=worldToScreen(wb.maxX,wb.maxY); ctx.setLineDash([7,7]); ctx.lineWidth=2; ctx.strokeStyle=star?'rgba(205,228,255,.32)':'rgba(40,60,70,.22)'; rr(tl.x,tl.y,br.x-tl.x,br.y-tl.y,20); ctx.stroke(); ctx.setLineDash([]);
     // 普通卡先画，等待卡及取消在其上层；当前拖动卡最后画，避免可见层与命中层不一致。
     const drag=st.drag&&st.drag.card;st.cards.forEach(c=>{if(c!==drag)drawWCard(c,now);});
-    // 造物等待=背面朝上的卡在轻晃·造好原地翻开（2026-07-10 用户拍板"给卡背造的舞台"·替代原青光气泡）
+    // 在合成位置绘制等待卡背和状态。
     //   普通玩家=素纸卡背；60级「彩虹卡背」解锁=虹辉星厂(引擎 cardBack rainbow)。上方保留"造物中…"小药丸(信息不丢)。
     if(!clean) st.pending.forEach(p=>{p.cancel=null; const s=worldToScreen(p.x,p.y), cw2=CW*view.s*0.92, ch2=CH*view.s*0.92;
       const sway=FXSET.fx?Math.sin(now*0.0032)*0.055:0, bob=FXSET.fx?Math.sin(now*0.0021)*3*view.s:0;
@@ -577,11 +575,10 @@
   /* ---------- 左上收藏抽屉（3 个收藏栏位·参考 1 代收藏夹） ---------- */
   function drawFavTile(x,y,w,h,d,now){
     dcell(x,y,w,h,d,now);
-    // 用户拍板：词典卡格不放 🤝（太挤）；收藏抽屉与画布仍标出“这是使用权限，不是拥有”。
     if(d.friendShared&&!d.owned){ ctx.textAlign='center'; ctx.textBaseline='middle'; drawEmoji('🤝',x+10,y+h-10,Math.max(14,w*.22)); }
   }
   function drawFavDrawer(now){
-    favEnsure(); st.favT += ((st.favOpen?1:0)-st.favT)*0.22;
+    favEnsure();
     const fw=Math.min(clamp(W*0.27,252,332), Math.max(218,st.PLAY_W-54)), tabW=30, tabH=78;
     const y=st.TICK_H+10, h=clamp(st.PLAY_H-106,294,420), x=-fw*(1-st.favT), tx=x+fw-1, ty=y+18;
     const tabY=y+64, searchY=y+101, boxH=28, listY=y+138, listH=h-152;
@@ -703,8 +700,8 @@
     block(cur,rowY,ow,sh,12,CREAM,GOLD,2.5,2); ctx.font=B(13); ctx.fillStyle=GOLD2; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('？？',cur+ow/2,rowY+sh/2); cur+=ow+18;
     block(cur,rowY,gbw,gbh,12,GOLD,INK,2.5); ctx.fillStyle=INK; ctx.font=B(13.5); ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(gt,cur+gbw/2,rowY+gbh/2+.5);st._combineGeometry.submit={x:cur,y:rowY,w:gbw,h:gbh};pushHot(cur,rowY,gbw,gbh,()=>combineSlots()); }
 
-  /* ---------- 右上竖排（2026-07-14 · 用户重排后：整理画布 → 固定画布 → 清空画布）：右下太挤·把画布类操作全归右上 ----------
-     rx=DICT_X-12 跟词典抽屉抽拉(同右下惯例)·合成台展开不影响·清空为危险次级(暖红)·固定为状态钮(开启态青色高亮同"钉住"惯例) */
+  /* 画布管理按钮放在词典左侧。 */
+
   function drawTopRightBar(){
     const items=[
       {ic:'🧽',t:'整理画布',fn:tidyCanvas},
@@ -814,7 +811,7 @@
     block(x,y,w,h,10,custom&&custom.face||PAPER,null,0,2);
     if(custom&&custom.image)legacyImageLayer(custom.image,x,y,w,h,10);   // 卡身(柔影纸面)
     const dlim=d.lim||((d.creatorDawn||(d.owned&&dawnAllOn()))?'dawn':'');   // 沿用内置卡面底纹。
-    const dhonor=!!(d.sponsor||d.only||d.broken);   // 有荣誉边框→dawn 只画底纹不画边(治叠边太粗·2026-07-10)
+    const dhonor=!!(d.sponsor||d.only||d.broken);
     if(dlim) limOverlay(x,y,w,h,10,dlim,now,false,dlim==='dawn'&&dhonor);   // 卡面皮肤(静态·防卡顿)
     // 边框(静态·按新稀有度梯度·词典里一律不流动)
     if(d.sponsor) rainbow(x,y,w,h,10,0.6,2);   // 赞助者·彩虹边(静态)
@@ -828,10 +825,10 @@
     ctx.restore();
     // 拥有✓（左上外角·满不透明）
     if(d.owned){ const gx=x+8,gy=y+8; ctx.beginPath(); ctx.arc(gx,gy,8,0,7); ctx.fillStyle=GREEN; ctx.fill(); ctx.lineWidth=1.6; ctx.strokeStyle=PAPER; ctx.stroke(); ctx.fillStyle='#fff'; ctx.font=B(9); ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('✓',gx,gy+.5); }
-    else if(d.listed===false && !d.origin){ ctx.font=B(w*0.115); const t='未上架',tw=ctx.measureText(t).width,bw=tw+8,bx=x+w/2-bw/2,by=y-6; block(bx,by,bw,w*0.17,w*0.085,MUTE,'#fff',1.1,0); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(t,x+w/2,by+w*0.17/2+.5); }   // @全库搜到的"别人未上架卡"：顶部灰标"未上架"(存在但拿不到·合成会被后端拒)
+    else if(d.listed===false && !d.origin){ ctx.font=B(w*0.115); const t='未上架',tw=ctx.measureText(t).width,bw=tw+8,bx=x+w/2-bw/2,by=y-6; block(bx,by,bw,w*0.17,w*0.085,MUTE,'#fff',1.1,0); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(t,x+w/2,by+w*0.17/2+.5); }
   }
 
-  /* ---------- 钉住卡牌（2026-07-12·做法A）：详情右上角钉子胶囊 + 台面固定 ---------- */
+  /* 钉住卡牌后，合成时将它留在台面。 */
   // 详情里这张卡当前是否已钉在台面（详情对象本身在台面就看它·否则看同名的台面实例）
   function isCardPinnedOnBoard(c){ if(!c) return false; if(st.cards.indexOf(c)>=0) return !!c.pinned; const inst=(st.cards||[]).find(x=>x.n===c.n); return !!(inst&&inst.pinned); }
   // 详情右上角"钉住/已钉住"胶囊（选型B·右对齐到 rightX）：未钉=纸底墨字·已钉=浅青底青字（套"固定画布"开启态青色惯例）
@@ -844,14 +841,14 @@
     let inst=(st.cards.indexOf(c)>=0)?c:(st.cards||[]).find(x=>x.n===c.n);
     if(!inst){ const d=DICT.find(x=>x.n===c.n)||Object.assign({n:c.n,e:c.e||'⭐',cat:c.cat,seq:c.seq,by:c.by,q:c.q,origin:c.origin,only:c.only},c); if(!spawnFromDict(d))return; inst=(st.cards||[]).slice().reverse().find(x=>x.n===c.n); }
     if(inst){ inst.pinned=!inst.pinned; c.pinned=inst.pinned; toast(inst.pinned?'📌 已钉在台面 · 合成也不会消失':'已取消钉住 · 恢复普通卡'); }
-    saveFactoryCanvas(true); }
+    saveFactoryCanvas(); }
 
   /* ---------- 详情弹窗(信息卡 A·点卡打开) ---------- */
   function detailCardStatus(c){return c.origin?'世界本源':'已发现';}
   function drawDetail(){ const c=st.detail; if(!c)return; const dd=(st.myCards||[]).find(x=>x.n===c.n)||DICT.find(x=>x.n===c.n)||COLL_META[c.n]||{}; ctx.fillStyle='rgba(47,58,74,.5)'; ctx.fillRect(0,0,W,H);   // 好友卡详情优先保留当前来源；公共/个人/本地词库继续作完整信息回退
     const mineFirst=!c.origin&&(st.myFirsts.has(c.n)||!!c.mineFirst||!!dd.mineFirst||!!dd.mine_first||c.by===PLAYER), ownFirst=mineFirst&&(isFirstCardData(c)||isFirstCardData(dd)||c.only||c.broken);
-    const w=Math.min(ownFirst?382:360,W*0.9), h=Math.min(ownFirst?510:502,H*0.94), x=W/2-w/2, y=H/2-h/2;   // 普通版 456→502：砍两行信息+加高·底部腾给内嵌评论区（2026-07-12）
-    st._dtHotStart=st.hot.length; st._dtRect={x:x,y:y,w:w,h:h};   // 穿透防护：详情自己的热区从这个下标开始·点击只认它们（⚠必须记场景私有 st.hot——引擎全局 HOT 在本场景恒空·build80 曾误用导致详情按钮全点不动·2026-07-12 修）
+    const w=Math.min(ownFirst?382:360,W*0.9), h=Math.min(ownFirst?510:502,H*0.94), x=W/2-w/2, y=H/2-h/2;
+    st._dtHotStart=st.hot.length; st._dtRect={x:x,y:y,w:w,h:h};   // 从此处记录详情弹窗的命中区域，防止点击穿透。
 
     block(x,y,w,h,20,PANEL,INK,3);
     // 固定头部（图标+名字+编号类别·不随滚动）
@@ -861,8 +858,8 @@
     drawEmoji(c.e,x+18+icon/2,y+18+icon/2,32);
     ctx.textAlign='left'; ctx.textBaseline='middle'; ctx.font=B(21); ctx.fillStyle=INK; ctx.fillText(fitText(c.n,w-180,''),x+88,y+28);   // 名字宽度留出右上角钉子胶囊的位置（w-104→w-180）
     ctx.font=SB(11); ctx.fillStyle=MUTE; ctx.fillText((c.seq?('#'+c.seq):'世界本源')+' · '+(c.cat||'抽象'),x+88,y+50);
-    { const pr=drawPinPill(x+w-14,y+14,isCardPinnedOnBoard(c)); pushHot(pr.x,pr.y,pr.w,pr.h,toggleDetailPin); }   // 右上角钉子（2026-07-12·钉住卡牌）
-    // 滚动内容区（2026-07-12 详情滚动化：旁白+信息+收藏+举报+荣誉履历+评论装不下一屏·头部/关闭固定·中间滚轮/上下滑）
+    { const pr=drawPinPill(x+w-14,y+14,isCardPinnedOnBoard(c)); pushHot(pr.x,pr.y,pr.w,pr.h,toggleDetailPin); }
+    // 详情正文可滚动，头部与底部按钮固定。
     const closeY2=y+h-46, clipTop=y+84, clipBot=closeY2-8, viewH=clipBot-clipTop, bw=w-36;
     if(st._dtName!==c.n){ st._dtName=c.n; st.detailScroll=0; st._dtDrag=null; }
     st.detailScroll=clamp(st.detailScroll||0,0,st.detailMax||0);
@@ -882,7 +879,7 @@
     cy+=5;
     cy+=7; const isColl=!!(st.collected&&st.collected.has(c.n)), collN=(dd.collectCnt!=null?dd.collectCnt:0), favIdx=isColl?favFolderOf(c.n):-1, favName=(favIdx>=0?(favEnsure()[favIdx].name||'已收藏'):'已收藏');
     block(x+18,cy,bw,38,12,PINK,PINKB,2.5); ctx.fillStyle=PINKB; ctx.font=B(13.5); ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText((isColl?('💖 '+favName+' · 点取消/转移'):'🤍 收藏'),x+w/2,cy+19); pushHotDt(x+18,cy,bw,38,()=>doCollectCard(c)); cy+=47;
-    if(c.seq){ cy=drawDetailLore(c,x,w,cy); }   // 荣誉履历(诞生/不再唯一/打破者·1代同款) → 内嵌评论（用户定序：履历在上评论在下）
+    if(c.seq){ cy=drawDetailLore(c,x,w,cy); }
     st.detailMax=Math.max(0,(cy+st.detailScroll)-(clipTop+8)-viewH+10);
     ctx.restore();
     if(st.detailMax>0){ const trH=viewH-8, thH=Math.max(26,trH*viewH/(viewH+st.detailMax)), thY=clipTop+4+(trH-thH)*(st.detailScroll/st.detailMax);
@@ -892,7 +889,6 @@
       ['分享卡牌',()=>{st.share=Object.assign({},c,{bornAt:(nativeCard(c.n)||{}).discoveredAt});st.detail=null;sfxClick();}],
       ['关闭',()=>{st.detail=null;sfxClick();}]];
     const footW=(bw-12)/3;footer.forEach((item,index)=>{const fx=x+18+index*(footW+6);block(fx,closeY2,footW,34,11,CREAM,INK,2.2);ctx.fillStyle=INK;ctx.font=B(11.5);ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(item[0],fx+footW/2,closeY2+17);pushHot(fx,closeY2,footW,34,item[1]);}); }
-  /* ---------- 详情荣誉履历（2026-07-12·1代同款文案）：仅此一张=👑诞生日；被打破=🕯️曾是仅此一张+诞生/不再唯一日+⚡打破者；普通=诞生日。数据=评论接口顺带的 lore（progress 最早两条=首发/打破） ---------- */
   function fmtMD2(s){ try{ const d=new Date(s); return (d.getMonth()+1)+'月'+d.getDate()+'日'; }catch(_){ return ''; } }
   function drawDetailLore(c,x,w,cy){
     const data=nativeCard(c.n),at=data&&data.discoveredAt;if(!at)return cy;
@@ -910,9 +906,8 @@
   }
   function doClearCanvas(){
     const pinned=(st.cards||[]).filter(c=>c&&c.pinned);
-    st.cards=pinned; st.slots=[null,null,null,null]; st.drag=null; st.pan=null; st.dictPan=null; st.favPan=null; st.drawerOpen=false; st.confirmClear=null; st._seeded=pinned.length>0;
-    if(pinned.length) saveFactoryCanvas(true);
-    else try{ localStorage.removeItem(FACTORY_CANVAS_STORE); }catch(_){}
+    st.cards=pinned; st.slots=[null,null,null,null]; st.drag=null; st.pan=null; st.dictPan=null; st.favPan=null; st.drawerOpen=false; st.confirmClear=null;
+    saveFactoryCanvas();
     toast(pinned.length?('已清空普通卡 · 📌保留 '+pinned.length+' 张钉住卡'):'已清空画布');
   }
   function drawClearConfirm(){ const m=st.confirmClear; if(!m)return; st._ccHotStart=st.hot.length; ctx.fillStyle='rgba(47,58,74,.6)'; ctx.fillRect(0,0,W,H);
@@ -930,18 +925,18 @@
 
   /* ---------- 待领/通知弹窗（登录拉 /notices·逐个弹）：举报奖励 / 安检下架 / 上架审核未通过 / 已公开上架被撤下 ---------- */
   /* ---------- 合成：请求、等待、提交完成后揭晓；失败按原操作恢复材料 ---------- */
-  // 把后端返回的卡（命中配方 / AI 造卡两种形态都归一过）变成画布立牌 + 触发对应庆典 + 同步本地集合
+  // 结果保存成功后，在台面放置卡牌并更新词典。
   function applyResult(norm,wx,wy){
     const data=nativeCard(norm.name),c=mk(norm.name,norm.e,norm.cat||'抽象','',norm.seq||0,wx,wy,!!(data&&data.isBase),false,norm.q||'',false);
     c.cardId=data&&data.id;c.instanceId=newInstanceId();c.lim=cardLim(norm);c.bornAt=data&&data.discoveredAt;c.scale=.2;
     st.cards.push(c);st.owned.add(norm.name);st.seen.add(norm.name);touchMyRecent(norm.name);
     META[norm.name]=Object.assign({},META[norm.name]||{},{n:c.n,e:c.e,cat:c.cat,q:c.q,seq:c.seq,lim:c.lim,bornAt:c.bornAt});
-    upsertDict(norm);markOwnership();saveFactoryCanvas(true);
+    upsertDict(norm);markOwnership();saveFactoryCanvas();
     const position=worldToScreen(wx,wy);
     if(norm.isNew){vibe(30);if(FXSET.celebrate)bigDisc(c);else{floatUp(position.x,position.y-50,'首次发现！'+norm.name,GOLD2,1600);sfxBig();}}
     else{floatUp(position.x,position.y-50,'合成完成',MUTE,900);sfxRepeat();}
   }
-  function upsertDict(norm){ _dataStamp++; st._favItemCache=null;   // 数据变了→词典/收藏缓存作废（M5）
+  function upsertDict(norm){ _dataStamp++; st._favItemCache=null;
     let d=DICT.find(x=>x.n===norm.name);   // 新合出的卡补进词典(本地·下次登录 browse 也会带它)
     if(!d){ d={n:norm.name,e:norm.e,cat:norm.cat||'抽象',seq:norm.seq||0,rar:Number(norm.rar)||0,likes:0,usage:0,holder:Number(norm.holder||norm.holder_cnt)||1,q:norm.q||'',season:0,origin:0,byName:(norm.by||''),lim:cardLim(norm),creatorFrame:!!(norm.creatorFrame||norm.creator_first_frame_active),creatorDawn:!!(norm.creatorDawn||norm.creator_dawn_active),foodTaste:norm.foodTaste||null}; DICT.push(d); }
     else { if(norm.seq) d.seq=norm.seq; if(norm.q) d.q=norm.q; if(norm.by) d.byName=norm.by; if(norm.holder||norm.holder_cnt) d.holder=Number(norm.holder||norm.holder_cnt)||d.holder; if(norm.rar!=null) d.rar=Number(norm.rar)||0; if(cardLim(norm)) d.lim=cardLim(norm); if(norm.creatorFrame||norm.creator_first_frame_active) d.creatorFrame=true; if(norm.creatorDawn||norm.creator_dawn_active) d.creatorDawn=true; if(norm.foodTaste)d.foodTaste=norm.foodTaste; } }
@@ -959,14 +954,13 @@
     }
     const pending={x:wx,y:wy,global:false,operationId:null};st.pending.push(pending);sfxThink();
     const identity=localIdentity;
-    const keepAwake=setInterval(()=>{try{if(typeof resetIdle==='function')resetIdle();}catch(_){}},20000);
     let result;
     try{
-      const promise=WXGC2_API.combineAndWait(items,id=>{pending.global=true;if(id)pending.operationId=id;});
+      const promise=WXGC2_API.combineAndWait(items,id=>{pending.global=true;if(id)pending.operationId=id;invalidate();});
       pending.operationId=promise.operationId||pending.operationId;
       result=await promise;
     }catch(_){result={ok:false,message:'这次合成没有完成，请重试。'};}
-    finally{clearInterval(keepAwake);const index=st.pending.indexOf(pending);if(index>=0)st.pending.splice(index,1);}
+    finally{const index=st.pending.indexOf(pending);if(index>=0)st.pending.splice(index,1);invalidate();}
     if(identity!==localIdentity)return;
     if(!result||!result.ok){
       const point=worldToScreen(wx,wy);floatUp(point.x,point.y-40,(result&&result.message)||'合成没有完成。',PINKB,2000);sfxFailure();if(restore)restore();return;
@@ -975,14 +969,11 @@
     const norm={id:card.id,name:card.name,e:card.emoji,cat:card.cat,seq:card.seq||0,q:card.descr||'',isNew:!!result.isNew,lim:cardLim(card)};
     applyResult(norm,wx,wy);rememberRecentCombine(items,norm);
   }
-  /* ---------- 整理画布（2026-07-14·方案 A：吸附最近网格·碰撞往右下推）----------
-     用户痛点=分享截图对不齐。点右上"🧽 整理"→ 每张卡各自吸附到最近网格·多张卡挤同一格时按顺序向右下推。
-     目标位置写进 c.tx/c.ty·主循环已有的缓动(c.x+=(c.tx-c.x)*0.3·每帧)自然带卡飞过去(≈0.5秒到位)。
-     ⚠ 钉住卡(📌)保留原位不动(心智=钉在台面)·但先把它当前所在格标记占用·防其它卡吸到它上面。
-     ⚠ Lv.45 后宽高各扩大 25%，旧网格点不位移；卡多超出世界内网格时仍继续向下扩展行(不 wrap 回堆叠)。 */
+  /* 将卡牌对齐最近的网格，钉住的卡仍留在原位。 */
+
   function tidyCanvas(){
     if(!st.cards||!st.cards.length){ toast('画布空空的·放几张卡再整理'); return; }
-    // ⚠ 卡是长方形(CW=84 CH=108)·网格步长 X/Y 必须分开算·否则纵向叠 16px(2026-07-14 用户线上截图报的bug)
+    // 横纵间距分别使用卡牌的宽度和高度。
     const grid=worldGrid(), stepX=grid.stepX, stepY=grid.stepY, firstX=grid.firstX, firstY=grid.firstY;
     const cols=grid.cols;   // Lv.1~44=16列，Lv.45+=20列；行数不设上限
     const occ=new Set();
@@ -1006,12 +997,12 @@
       occ.add(row+'.'+col);
       c.tx=firstX+col*stepX; c.ty=firstY+row*stepY;   // 原网格点在扩建后仍保持原坐标；新增格只出现在四周
     });
-    saveFactoryCanvas(true);   // 存的 slim 现在带 tx/ty(2026-07-14 加)·动画中途关游戏重开仍继续走到目标
+    saveFactoryCanvas();   // 保存动画的目标坐标。
     const pinNote=pinned.length?('·📌钉住 '+pinned.length+' 张原位不动'):'';
     toast('已整理·'+sorted.length+' 张卡对齐网格'+pinNote);   // sfxClick 由按钮层统一发声·避免双响
   }
 
-  // 钉住的卡（📌·2026-07-12「钉住卡牌」做法A）合成时不消耗、留在台面原地；结果冒到它旁边空位。
+  // 钉住的材料保留，合成结果出现在附近。
   //   都没钉=老行为（两张都吃掉·结果冒中点）；一张钉=只吃没钉那张·结果冒钉住卡右边；两张都钉=都留下·结果冒旁边。
   function combineCards(a,b){
     const consume=[a,b].filter(c=>!c.pinned), kept=[a,b].filter(c=>c.pinned);
@@ -1022,19 +1013,19 @@
     else if(kept.length===1){ wx=kept[0].x+jx(); wy=kept[0].y+jy(); }
     else { wx=(a.x+b.x)/2+jx(); wy=(a.y+b.y)/2+jy(); }
     if(consume.length) st.cards=st.cards.filter(c=>consume.indexOf(c)<0);   // 只移除没钉的（钉住的留在台面）
-    saveFactoryCanvas(true);
-    doCombine([a.n,b.n],wx,wy,()=>{ consume.forEach(c=>{ c.scale=0.4; c.tx=c.x; c.ty=c.y; }); st.cards.push(...consume); saveFactoryCanvas(true); }); }   // 出错只把"被吃掉的那些"放回（钉住的从没动过）
+    saveFactoryCanvas();
+    doCombine([a.n,b.n],wx,wy,()=>{ consume.forEach(c=>{ c.scale=0.4; c.tx=c.x; c.ty=c.y; }); st.cards.push(...consume); saveFactoryCanvas(); }); }   // 出错只把"被吃掉的那些"放回（钉住的从没动过）
   function combineSlots(){ const f=st.slots.filter(Boolean); if(f.length<2){ floatUp(st.PLAY_W/2,H-110,'至少放 2 张卡',PINKB,1000); return; }
-    const cw=screenToWorld(st.PLAY_W/2,st.TICK_H+st.PLAY_H*0.4), items=f.map(s=>s.n), snap=f.slice(); st.slots=[null,null,null,null]; saveFactoryCanvas(true);
-    doCombine(items,cw.x,cw.y,()=>{ for(let i=0;i<4;i++) st.slots[i]=snap[i]||null; saveFactoryCanvas(true); }); }   // 出错把卡放回合成台格子
+    const cw=screenToWorld(st.PLAY_W/2,st.TICK_H+st.PLAY_H*0.4), items=f.map(s=>s.n), snap=f.slice(); st.slots=[null,null,null,null]; saveFactoryCanvas();
+    doCombine(items,cw.x,cw.y,()=>{ for(let i=0;i<4;i++) st.slots[i]=snap[i]||null; saveFactoryCanvas(); }); }   // 出错把卡放回合成台格子
   function spawnFromDict(d){
     const data=d&&nativeCard(d.n);if(!data)return false;
     sfxClick();const cw=screenToWorld(st.PLAY_W*.5,st.TICK_H+st.PLAY_H*.45),m=META[d.n]||{};
     const c=mk(data.name,data.emoji,m.cat||d.cat||'抽象','',m.seq||d.seq||0,cw.x+(Math.random()*120-60),cw.y+(Math.random()*80-40),!!data.isBase,false,m.q||d.q||'',false);
     c.cardId=data.id;c.instanceId=newInstanceId();c.bornAt=data.discoveredAt;c.lim=cardLim(data);c.owned=true;c.scale=.3;
-    st.cards.push(c);saveFactoryCanvas();return true;
+    st.cards.push(c);saveFactoryCanvas();invalidate();return true;
   }
-  function floatUp(x,y,t,color,ms){ st.floats.push({x,y,text:t,color,until:performance.now()+(ms||1000),born:performance.now()}); }
+  function floatUp(x,y,t,color,ms){ const born=performance.now(); st.floats.push({x,y,text:t,color,until:born+(ms||1000),born}); invalidate(); }
   function refreshBattleTaskPocket(){}
   // 收藏/取消收藏一张卡（详情面板🤍按钮·接 ③ /cards/collect·收藏满足每日任务4）
   async function doCollectCard(card){
@@ -1082,18 +1073,33 @@
   function wrap(text,cx,y,maxW,lh){ const a=[...text]; let line='',ls=[]; for(const ch of a){ if(ctx.measureText(line+ch).width>maxW){ ls.push(line); line=ch; } else line+=ch; } if(line)ls.push(line); ctx.textAlign='center'; ls.forEach((l,i)=>ctx.fillText(l,cx,y+i*lh)); }
 
   /* ---------- 首发动画 ---------- */
-  function confetti(n){ const a=[]; for(let i=0;i<n;i++){ const an=Math.random()*6.28,sp=180+Math.random()*260; a.push({x:0,y:0,vx:Math.cos(an)*sp,vy:Math.sin(an)*sp-160,rot:Math.random()*6.28,vr:(Math.random()-.5)*12,c:RAINBOW[i%6],w:7+Math.random()*5,h:11+Math.random()*6}); } return a; }
-  function bigDisc(c){ st.effects.push({type:'big',card:c,t0:performance.now(),conf:confetti(46),dismiss:null,shareReady:false}); sfxBig(); }
-  function smallDisc(c){ st.effects.push({type:'small',card:c,t0:performance.now(),store:{}}); sfxSmall(); }
-  function drawEffects(now){ for(let i=st.effects.length-1;i>=0;i--){ const ef=st.effects[i], t=(now-ef.t0)/1000;
-    if(ef.type==='small'){ drawSmall(ef,t,now); if(t>1.5) st.effects.splice(i,1); }
-    else { drawBig(ef,t,now); if(ef.dismiss&&now>ef.dismiss&&!ef.fading) ef.fading=now; if(ef.fading&&now-ef.fading>360) st.effects.splice(i,1); } } }
-  function drawBig(ef,t,now){ const cx=W/2,cy=H/2-4; const fin=Math.min(1,t/.25), out=ef.fading?Math.max(0,1-(now-ef.fading)/360):1, a=fin*out;
+  function confetti(n){ const a=[]; for(let i=0;i<n;i++){ const an=Math.random()*6.28,sp=180+Math.random()*260; a.push({vx:Math.cos(an)*sp,vy:Math.sin(an)*sp-160,rot:Math.random()*6.28,vr:(Math.random()-.5)*12,c:RAINBOW[i%6],w:7+Math.random()*5,h:11+Math.random()*6}); } return a; }
+  const DISCOVERY_MOTION_MS=2600, DISCOVERY_FADE_MS=360;
+  function bigDisc(c){ st.effects.push({card:c,t0:null,conf:null}); invalidate(); }
+  function drawEffects(now){
+    // 并行结果按抵达顺序揭晓。当前弹层播完后定格，后面的等到轮到自己才开播。
+    if(COVERED) return Infinity;
+    if(st.effects[0]?.fading!=null&&now-st.effects[0].fading>=DISCOVERY_FADE_MS) st.effects.shift();
+    const ef=st.effects[0];
+    if(!ef) return Infinity;
+    if(ef.t0==null){
+      // 当前触摸或面板先完成，结果已在本地，腾出前景再揭晓。
+      if(!controlsFree()||st.favPick||st.menuOpen||OVERLAY||gestureInProgress()) return Infinity;
+      ef.t0=now; ef.conf=confetti(46); sfxBig();
+    }
+    const age=Math.min(now-ef.t0,DISCOVERY_MOTION_MS);
+    drawBig(ef,age/1000,now);
+    return age<DISCOVERY_MOTION_MS||ef.fading!=null?0:Infinity;
+  }
+  function drawBig(ef,t,now){
+    const cx=W/2,cy=H/2-4, fin=Math.min(1,t/.25);
+    const a=fin*(ef.fading==null?1:Math.max(0,1-(now-ef.fading)/DISCOVERY_FADE_MS));
+    const motionTime=ef.t0+t*1000;
     ctx.fillStyle='rgba(26,34,42,'+(.62*a)+')'; ctx.fillRect(0,0,W,H); if(t<.4){ ctx.fillStyle='rgba(255,250,235,'+(.6*(1-t/.4))+')'; ctx.fillRect(0,0,W,H); }
-    ctx.save(); ctx.globalAlpha=a; ctx.translate(cx,cy); ctx.rotate(now/1400); const R=Math.min(W,H)*0.62*Math.min(1,t/.9+.2);
+    ctx.save(); ctx.globalAlpha=a; ctx.translate(cx,cy); ctx.rotate(motionTime/1400); const R=Math.min(W,H)*0.62*Math.min(1,t/.9+.2);
     for(let k=0;k<22;k++){ const a0=k*(6.283/22); ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,R,a0,a0+(6.283/22)*.5); ctx.closePath(); ctx.fillStyle=(k%2?'rgba(199,154,62,.18)':'rgba(127,233,221,.10)'); ctx.fill(); } ctx.restore();
     ctx.save(); ctx.globalAlpha=a; const ring=ease.outCubic(Math.min(1,t/.8)); ctx.beginPath(); ctx.arc(cx,cy,40+ring*170,0,7); ctx.strokeStyle='rgba(255,236,180,'+(.5*(1-ring))+')'; ctx.lineWidth=10*(1-ring)+2; ctx.stroke();
-    const cs=.3+ease.outBack(Math.min(1,t/.6))*.7; card(cx,cy+8,150*cs,196*cs,Object.assign({},ef.card,{only:false}),{now,caption:ef.card.q||ef.card.descr||''});
+    const cs=.3+ease.outBack(Math.min(1,t/.6))*.7; card(cx,cy+8,150*cs,196*cs,Object.assign({},ef.card,{only:false}),{now:motionTime,caption:ef.card.q||ef.card.descr||''});
     if(t>.5&&t<1.4){ const sw=(t-.5)/.9; ctx.save(); rr(cx-75,cy+8-98,150,196,18); ctx.clip(); const gx=cx-90+sw*180; const g=ctx.createLinearGradient(gx-14,0,gx+14,0); g.addColorStop(0,'rgba(255,255,255,0)'); g.addColorStop(.5,'rgba(255,255,255,.55)'); g.addColorStop(1,'rgba(255,255,255,0)'); ctx.fillStyle=g; ctx.fillRect(cx-90,cy-110,180,230); ctx.restore(); }
     // 首次发现横幅，沿用原弹跳登场。
     const bt=ease.outBack(Math.min(1,Math.max(0,(t-.1)/.5))); let byc=Math.max(cy-182, st.TICK_H+56);   // 横幅上移·和卡片留空隙·但不顶到屏幕顶部
@@ -1111,7 +1117,11 @@
     ctx.font=B(nameFs); ctx.fillText(nbm,cx,bby+bbh*0.66); ctx.restore();
     ctx.restore();
     ctx.globalAlpha=a*Math.min(1,Math.max(0,(t-.3)/.4)); ctx.font=B(14); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(W<400?('本档发现 · #'+ef.card.seq):('你在这份存档中发现了【'+ef.card.n+'】· #'+ef.card.seq),cx,cy+132); ctx.globalAlpha=a;
-    const dt=.016; ef.conf.forEach(p=>{ p.vy+=520*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.rot+=p.vr*dt; ctx.save(); ctx.translate(cx+p.x,cy+p.y); ctx.rotate(p.rot); ctx.globalAlpha=a*Math.max(0,1-t/2.6); ctx.fillStyle=p.c; ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); ctx.restore(); });
+    if(t<DISCOVERY_MOTION_MS/1000) ef.conf.forEach(p=>{
+      ctx.save(); ctx.translate(cx+p.vx*t,cy+p.vy*t+260*t*t); ctx.rotate(p.rot+p.vr*t);
+      ctx.globalAlpha=a*(1-t*1000/DISCOVERY_MOTION_MS); ctx.fillStyle=p.c;
+      ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); ctx.restore();
+    });
     ctx.restore();
     if(t>1&&!ef.fading){ ctx.globalAlpha=a*Math.min(1,(t-1)/.4); ctx.textAlign='center'; ctx.textBaseline='middle';
       const sbt='查看分享图';ctx.font=B(13);
@@ -1121,17 +1131,7 @@
       ef.shareBtn={x:sxb,y:syb,w:sw2,h:38};ef.reportBtn=null;
     }
   }
-  function drawSmall(ef,t,now){ const cx=W/2,cy=H*0.44, inn=Math.min(1,t/.5), out=t>1?Math.max(0,1-(t-1)/.5):1, a=inn*out;
-    ctx.save(); ctx.globalAlpha=a; if(!ef.store.s){ ef.store.s=[]; for(let i=0;i<12;i++) ef.store.s.push({a:Math.random()*6.28,sp:46+Math.random()*56}); }
-    const p=ease.outCubic(Math.min(1,t/.7)); ctx.save(); ctx.globalAlpha=a*(1-p); ctx.setLineDash([7,7]); ctx.strokeStyle=TEAL; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(cx,cy-6,38+p*84,0,7); ctx.stroke(); ctx.restore();
-    ef.store.s.forEach((s,i)=>spark(cx+Math.cos(s.a)*s.sp*p,cy-6+Math.sin(s.a)*s.sp*p,7,(1-p)*a,RAINBOW[i%6]));
-    const cs=.4+ease.outBack(Math.min(1,t/.55))*.6; card(cx,cy-6,90*cs,118*cs,Object.assign({},ef.card,{owned:true}),{now});   // 个人首发卡放大(58→90)
-    ctx.font=B(15); const lab='个人首次发现 ✦',lw=ctx.measureText(lab).width,pw=lw+26,ph=30,lx=cx-pw/2,ly=cy+66; rr(lx+2,ly+2,pw,ph,ph/2); ctx.fillStyle=SH; ctx.fill(); rr(lx,ly,pw,ph,ph/2); ctx.fillStyle=GREEN; ctx.fill(); ctx.lineWidth=2.5; ctx.strokeStyle='#fff'; ctx.stroke(); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(lab,cx,ly+ph/2+.5);
-    ctx.restore(); }
-
   /* ---------- 发现海报 ---------- */
-  // 证书「诞生于」日期：用卡真实诞生时刻(抢首发那一刻打的 bornAt)·换算北京时间·缺就退当天。
-  //   （2026-07-04 修：原写死 '2026 年 6 月 26 日'=开发期占位假数据·所有卡都一样）
   function fmtBirthDate(c){
     var t=c&&(c.bornAt||c.unlockedAt); var d=t?new Date(t):new Date(); if(isNaN(d.getTime())) d=new Date();
     var bj=new Date(d.getTime()+8*3600*1000);   // 转北京时(UTC+8)·再取 UTC 分量=北京当天的年月日
@@ -1139,7 +1139,7 @@
   }
   function drawShare(){ const c=st.share; if(!c)return; const g=ctx.createLinearGradient(0,0,W,H); g.addColorStop(0,'#fbf7ef'); g.addColorStop(1,'#ece5d8'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
     ['✨','🎉','🎊','✨'].forEach((s,i)=>drawEmoji(s,[0.08,0.34,0.06,0.92][i]*W,[0.16,0.1,0.66,0.82][i]*H,W*0.022,.85));
-    const hx=W*0.27, hy=H*0.52; card(hx,hy,W*0.17,W*0.17*1.33,Object.assign({},c,{only:false}),{}); 
+    const hx=W*0.27, hy=H*0.52; card(hx,hy,W*0.17,W*0.17*1.33,Object.assign({},c,{only:false}),{});
     const rx=W*0.5; let ry=H*0.22; ctx.textAlign='left';
     ctx.font=B(W*0.016); ctx.fillStyle=GOLD2; ctx.fillText('✦ MY DISCOVERY · 我的发现 ✦',rx,ry); ry+=H*0.1;
     ctx.font=SB(W*0.014); ctx.fillStyle='#7a8696'; drawEmoji('🎉',rx+W*0.012,ry-W*0.004,W*0.018); ctx.fillText('恭喜！你刚刚完成了一次——',rx+W*0.032,ry); ry+=H*0.08;
@@ -1156,29 +1156,60 @@
   /* ---------- 可点区域 ---------- */
   function pushHot(x,y,w,h,fn){ st.hot.push({x,y,w,h,fn}); }
   function hitHot(p){ for(let i=st.hot.length-1;i>=0;i--){ const r=st.hot[i]; if(p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h) return r; } return null; }
-  // 弹窗专用命中（2026-07-12 防穿透统一机制）：只认下标 ≥ start 的热区（start=该弹窗 draw 开头记下的 st.hot 长度）。
-  //   命中更早注册的（=压在弹窗底下的详情/词典/场景）一律判 null 不执行；命中更晚的（=叠在更上层的弹窗按钮）执行=行为正确。
-  //   ⚠ 已知取舍：三层弹窗叠加时·点最上层弹窗的空白若压着中间层按钮仍会误触（罕见·rect 三态化改动大·暂不做）。
+  // 只执行当前弹窗的命中区域，避免点击穿透。
   function hitHotFrom(p,start){ for(let i=st.hot.length-1;i>=0;i--){ const r=st.hot[i]; if(p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h) return (i>=(start||0))?r:null; } return null; }
-  // 详情滚动区专用注册（2026-07-12 治"半露按钮热区越界"）：按当前 st._dtClip 上下沿裁剪后再注册·全被裁掉=不注册（自带相交判断）。
+  // 详情按钮的命中范围裁到可见滚动区域内。
   function pushHotDt(x,y,w,h,fn){ const cl=st._dtClip; if(!cl) return; const y1=Math.max(y,cl.top), y2=Math.min(y+h,cl.bot); if(y2>y1) st.hot.push({x,y:y1,w,h:y2-y1,fn}); }
 
-
-
-  /* ---------- 主渲染（由引擎主循环每帧调用·原 loop 拆壳·内容一字未动） ---------- */
+  /* ---------- 主渲染 ---------- */
+  function approach(value,target,step,epsilon){
+    return Math.abs(target-value)<=epsilon?target:value+(target-value)*step;
+  }
+  function advanceMotion(){
+    const dict=st.dictOpen?1:0, fav=st.favOpen?1:0, held=st.drag?.card;
+    st.dictT=approach(st.dictT,dict,.2,.001);
+    st.favT=approach(st.favT,fav,.22,.001);
+    let moving=st.dictT!==dict||st.favT!==fav;
+    for(const card of st.cards){
+      card.scale=approach(card.scale,card.tscale,.22,.001);
+      if(card!==held){
+        card.x=approach(card.x,card.tx,.3,.1);
+        card.y=approach(card.y,card.ty,.3,.1);
+      }
+      if(card.scale!==card.tscale||card.x!==card.tx||card.y!==card.ty) moving=true;
+    }
+    return moving;
+  }
+  const animatedSkins=new Set(['sea','hearth','starfire','firefly','dawn','flow','spark','pearl']);
   function drawFrame(){
-    const now=performance.now(), clean=updatePhotoMode(now); ctx.fillStyle='#eef3f8'; ctx.fillRect(0,0,W,H);
+    const now=performance.now(), clean=updatePhotoMode(now);
+    st.hot.length=0;
+    if(st.share){ drawShare(); return Infinity; }   // 分享图盖满画面，下层无需跟着结果或等待动画重画
+    const moving=advanceMotion();
     st.floats=st.floats.filter(f=>f.until>now);
-    st.cards.forEach(c=>{ c.scale+=(c.tscale-c.scale)*0.22; if(c!==(st.drag&&st.drag.card)){ c.x+=(c.tx-c.x)*0.3; c.y+=(c.ty-c.y)*0.3; } });
-    st.dictT += ((st.dictOpen?1:0)-st.dictT)*0.2; computeGeom(); clampView(); syncSearchBox(); st.hot.length=0;
+    ctx.fillStyle='#eef3f8'; ctx.fillRect(0,0,W,H);
+    computeGeom(); clampView(); syncSearchBox();
     drawPlay(now,clean);
-    if(clean){ if(FRAMEN%45===0) saveFactoryCanvas(); return; }   // 真净屏：只留工作台、卡牌与背景；其它 UI/提示/玩法输入全部暂停
-    drawFavDrawer(now); drawDict(now); drawHUD(); drawCombine(); drawTopRightBar(); drawMenu(); drawEffects(now);
-    if(st.comboFx) drawComboFx(now);   // 彩蛋⑦：流水线全开庆祝（一次性动画·播完自动清空·平时零开销）
-    if(st.cardBubble) drawCardBubble(now);   // 彩蛋②：卡牌旁白气泡（画在弹层之前·开详情等弹层时自然被盖住）
-    if(st.detail)drawDetail();if(st.favPick)drawFavPickModal();if(st.share)drawShare();if(st.confirmClear)drawClearConfirm();
-    if(st.photoMode) drawPhotoCountdown(now);
-    if(FRAMEN%45===0) saveFactoryCanvas();
+    let next=Infinity;
+    if(!CANVAS_IDLE&&FXSET.fx&&(tabletopMode()||(st.cards.length&&animatedSkins.has(localSkin)))) next=AMBIENT_FRAME_MS;
+    if(clean) return Math.min(next,moving?0:Infinity,st.photoMode.restoreAt-now);
+    drawFavDrawer(now); drawDict(now); drawHUD(); drawCombine(); drawTopRightBar(); drawMenu();
+    const discovery=drawEffects(now);
+    if(st.comboFx) drawComboFx(now);
+    if(st.cardBubble) drawCardBubble(now);
+    if(st.detail) drawDetail();
+    if(st.favPick) drawFavPickModal();
+    if(st.confirmClear) drawClearConfirm();
+    if(st.photoMode){
+      drawPhotoCountdown(now);
+      next=Math.min(next,(st.photoMode.hideAt-now)%1000||1000);
+    }
+    if(moving||st.floats.length||st.comboFx||discovery===0) return 0;
+    if(st.effects[0]?.t0!=null) return Infinity;   // 首次发现定格后还能查看分享图或点空白继续
+    if(st.pending.length) next=Math.min(next,!CANVAS_IDLE&&FXSET.fx?AMBIENT_FRAME_MS:300-now%300);
+    if(st.cardBubble) next=Math.min(next,st.cardBubble.until-now);
+    if(!CANVAS_IDLE&&(st.dictSearchActive||st.favSearchActive)) next=Math.min(next,500-now%500);
+    return next;
   }
   const loop=()=>{ if(STILL) stillPaint(); };   // 兼容原代码各处 if(STILL) loop() 的静帧补画调用
 
@@ -1186,11 +1217,12 @@
   function hitCard(p){ const wp=screenToWorld(p.x,p.y); for(let i=st.cards.length-1;i>=0;i--){ const c=st.cards[i]; if(Math.abs(wp.x-c.x)<=CW/2&&Math.abs(wp.y-c.y)<=CH/2) return c; } return null; }
   function overlap(c){ for(const o of st.cards){ if(o===c)continue; if(Math.abs(c.x-o.x)<CW*0.6&&Math.abs(c.y-o.y)<CH*0.6) return o; } return null; }
   function outsideWorld(c){ const b=worldBounds(); return c.x<b.minX||c.x>b.maxX||c.y<b.minY||c.y>b.maxY; }
-  function backToDict(c,p,msg){ st.cards=st.cards.filter(x=>x!==c); saveFactoryCanvas(true); floatUp(clamp(p.x,30,Math.max(32,st.PLAY_W-30)),clamp(p.y,st.TICK_H+28,st.TICK_H+st.PLAY_H-28),msg||'已放回词典',MUTE,900); }
+  function backToDict(c,p,msg){ st.cards=st.cards.filter(x=>x!==c); saveFactoryCanvas(); floatUp(clamp(p.x,30,Math.max(32,st.PLAY_W-30)),clamp(p.y,st.TICK_H+28,st.TICK_H+st.PLAY_H-28),msg||'已放回词典',MUTE,900); }
   const inPlay=p=>p.x>=0&&p.x<st.toggleRect.x&&p.y>=st.TICK_H, overDict=p=>p.x>=st.toggleRect.x;
 
   // 多指追踪：双指捏合缩放(#8·触屏没鼠标滚轮·容器里靠两指捏合缩放画布)
   const ptrs=new Map();
+  function gestureInProgress(){ return st.drag||st.pan||st.dictPan||st.favPan||st.pinch||st._dtDrag||st.favPick?.pan; }
   function pinchDist(){ const a=[...ptrs.values()]; if(a.length<2)return 0; return Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y); }
   function pinchMid(){ const a=[...ptrs.values()]; return {x:(a[0].x+a[1].x)/2,y:(a[0].y+a[1].y)/2}; }
   // 清空多指追踪 + 所有手势状态·切场景进/出时各调一次·根治"幽灵手指"：
@@ -1198,10 +1230,8 @@
   //   该指就残留在 ptrs 里；下次单指触摸凑成两点→被误判双指捏合→画布乱缩放（玩家反馈的严重 bug）。
   function clearGestures(){ if(st.favPick)st.favPick.pan=null; ptrs.clear(); st.pinch=null; st.pan=null; st.dictPan=null; st.favPan=null; if(st.drag){ try{ st.drag.card.tscale=1; }catch(_){} st.drag=null; } try{ clearTimeout(st._pressHint); clearTimeout(st._hoverHint); }catch(_){} st.cardBubble=null; }
 
-  /* 彩蛋②：长按/悬停 → 卡上冒气泡（单击仍是看详情·不冲突）。
-     内容：有旁白的卡 = 40% 显示自己的旁白 / 60% 随机吐槽（用户 2026-07-03 定比例）；没旁白的卡 = 100% 吐槽。
-     暖底金边金字·与详情页旁白框同款配色（B 造物工坊：造物有生命的小惊喜）。
-     ⚠ 吐槽语录 CARD_QUIPS：每句都要"放在任何卡上都成立"·短(气泡装得下)·不碰真实IP/敏感词；以后加新句=往数组尾部加一行。 */
+  /* 长按或悬停卡牌时显示旁白。 */
+
   var CARD_QUIPS=[
     '看什么看，没见过卡牌呀~','再盯着我，我可要脸红了','别戳了别戳了，怪痒的','盯…盯…盯什么盯！',
     '你的手放我头上多久了，心里没数吗','长按我干嘛，我又不是电梯按钮','被你发现我会说话了','嘘——我在思考造物的奥秘',
@@ -1215,13 +1245,10 @@
   function showCardBubble(c,p){ var q=(c&&c.q)||'';
     var quip=CARD_QUIPS[Math.floor(Math.random()*CARD_QUIPS.length)];
     var txt=(q&&Math.random()<0.4)?q:quip;   // 40% 旁白 / 60% 吐槽·没旁白全吐槽
-    st.cardBubble={ txt:txt, x:p.x, y:p.y, until:performance.now()+2600 }; }
+    st.cardBubble={ txt:txt, x:p.x, y:p.y, until:performance.now()+2600 }; invalidate(); }
 
-  /* 彩蛋⑦：流水线全开（短时间连合 5 次 → 齿轮彩带庆祝·方案C·2026-07-03 用户选定）
-     · 设置开关 FXSET.comboFx（默认开·设置→画面与性能·关了完全不触发）
-     · 一次性动画（性能红线F3）：平时 st.comboFx=null=每帧只多一个空判断·零开销；
-       触发时一次性生成彩带参数 → 播 2.6 秒自动清空（数组释放·无残留状态无独立循环）；
-       彩带位置按 age 公式解析算（不逐帧积分）；齿轮预渲染离屏贴图（不每帧画 emoji 字体）。 */
+  /* 短时间内连续合成五次，触发一次齿轮彩带动画。 */
+
   const COMBO_GAP=20000, COMBO_NEED=5;   // 两次合成间隔<20秒算连击·连满5次触发·触发后重新数
   let _comboN=0,_comboLast=0,_gearImg=null;
   function noteCombo(){ if(!(FXSET&&FXSET.comboFx!==false)) return; const n=performance.now();
@@ -1233,7 +1260,7 @@
     for(let i=0;i<46;i++) parts.push({ x:px0+Math.random()*pxw, vx:(Math.random()-0.5)*0.16, vy:-(0.22+Math.random()*0.16),
       rot:Math.random()*7, vr:(Math.random()-0.5)*0.01, c:['#c79a3e','#1fb6a6','#d99a2e','#c2557a','#3a72b8'][i%5], w:7+Math.random()*6 });
     st.comboFx={ t0:performance.now(), parts:parts }; try{ sfxClaim(); }catch(_){} }
-  function drawComboFx(now){ const fx=st.comboFx; if(!fx) return; const t=now-fx.t0; if(t>2600){ st.comboFx=null; if(st._comboDemoLoop){ startComboFx(); } return; }   // demo 模式循环回放(仅 ?combodemo=1·线上不会)
+  function drawComboFx(now){ const fx=st.comboFx; if(!fx) return; const t=now-fx.t0; if(t>2600){ st.comboFx=null; if(st._comboDemoLoop){ startComboFx(); } return; }
     const img=gearImg(), spin=t*0.004, gy=st.TICK_H+st.PLAY_H-46;
     [[46,1],[st.PLAY_W-46,-1]].forEach(g=>{ ctx.save(); ctx.translate(g[0],gy); ctx.rotate(spin*g[1]); ctx.drawImage(img,-32,-32,64,64); ctx.restore(); });
     ctx.save(); ctx.beginPath(); ctx.rect(0,st.TICK_H,st.PLAY_W,st.PLAY_H); ctx.clip();   // 彩带只落在画布区·不压词典
@@ -1243,7 +1270,7 @@
     const bp=ease.outBack(clamp(t/340,0,1)), a=clamp((2600-t)/300,0,1);
     ctx.save(); ctx.globalAlpha=Math.min(1,a); ctx.translate(st.PLAY_W/2,gy-52); ctx.scale(bp,bp);
     block(-128,-26,256,52,16,'#fff9ec',GOLD,3,4); ctx.font=B(20); ctx.fillStyle=GOLD2; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('🔥 流水线全开 ×5',0,.5); ctx.restore(); }
-  function drawCardBubble(now){ if(!st.cardBubble) return; if(now>st.cardBubble.until){ st.cardBubble=null; return; }
+  function drawCardBubble(now){ if(!st.cardBubble) return; if(now>=st.cardBubble.until){ st.cardBubble=null; return; }
     var b=st.cardBubble, t='「'+b.txt+'」'; ctx.font=SB(12.5); var w=Math.min(ctx.measureText(t).width+22, W*0.72), h=32, x=clamp(b.x-w/2,6,W-w-6), y=clamp(b.y-70,st.TICK_H+6,H-h-14);
     block(x,y,w,h,12,'#fff7e6',GOLD,2,3);
     ctx.beginPath(); ctx.moveTo(x+w/2-6,y+h-1); ctx.lineTo(x+w/2+6,y+h-1); ctx.lineTo(x+w/2,y+h+8); ctx.closePath(); ctx.fillStyle='#fff7e6'; ctx.fill(); ctx.strokeStyle=GOLD; ctx.lineWidth=2; ctx.stroke();
@@ -1252,7 +1279,7 @@
   legacyListen(cv,'pointerdown',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return;
     if(st.photoMode){ initAudio(); const reason=photoHidden()?'touch':'cancel'; finishPhotoMode(reason); try{sfxClick();}catch(_){} return; }   // 净屏时首个触摸只负责恢复；倒计时内触摸=取消，不会穿透拖卡/合成
     initAudio(); try{ parent.postMessage('wxgc-activity','*'); }catch(_){}   // #13 通知外壳"有交互"→重置挂机计时
-    if(OVERLAY) return;   // 引擎弹层(评论窗/新手教程/@提示)开着=输入全权归引擎的 OVERLAY.hit·场景一概不碰——否则同一次点击被处理两遍·会误触/误关弹层底下的详情和场景（2026-07-12 对抗审查抓出·与 st.hot 修复配套）
+    if(OVERLAY) return;   // 教程等覆盖层独立接收输入。
     const p=toS(e);
     if(e.isPrimary) ptrs.clear();   // 主指(第一根手指)落下时·场上本不该有别的手指→先清掉可能残留的"幽灵手指"(切场景返回后遗留在 ptrs 里的触摸点)·防单指滑动被误判成双指捏合缩放·绝不影响真正的双指(第二指 isPrimary=false 不清)
     ptrs.set(e.pointerId,p);
@@ -1262,17 +1289,17 @@
     if(ptrs.size>2) return;
     if(st.favPick){ const m=st.favPick,r=m.rect;
       if(!m.busy&&r&&p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h){m.pan={y:p.y,scroll:m.scroll||0,moved:false};return;}
-      const h=hitHotFrom(p,st._fpHotStart);if(h)h.fn();return;}   // 收藏选夹弹窗·点框外不关，避免误取消（2026-07-12 起各弹窗分支全用 hitHotFrom=只认自己的按钮·防误触压在底下的详情/场景热区）
+      const h=hitHotFrom(p,st._fpHotStart);if(h)h.fn();return;}   // 收藏弹窗只响应自己的按钮。
     if(st.confirmClear){ const h=hitHotFrom(p,st._ccHotStart); if(h){ h.fn(); } return; }   // 清空画布二次确认·点按钮·点框外不关(防误清)
     if(st.share){ st.share=null; return; }
-    const big=st.effects.find(x=>x.type==='big'&&!x.fading);
-    if(big){
-      if(big.shareBtn&&p.x>=big.shareBtn.x&&p.x<=big.shareBtn.x+big.shareBtn.w&&p.y>=big.shareBtn.y&&p.y<=big.shareBtn.y+big.shareBtn.h){ st.share=big.card; sfxClick(); return; }
+    const big=st.effects[0];
+    if(big?.t0!=null){
+      if(big.fading!=null) return;
+      if(big.shareBtn&&p.x>=big.shareBtn.x&&p.x<=big.shareBtn.x+big.shareBtn.w&&p.y>=big.shareBtn.y&&p.y<=big.shareBtn.y+big.shareBtn.h){ st.share=big.card; stashAllInputs(); sfxClick(); return; }
       big.fading=performance.now(); return; }
-    // 2026-07-17 换季拆除：里程碑弹窗 pointerdown 分支已摘。
     if(st.detail&&!st.favPick){   // favPick(收藏选夹)叠在详情上时让位给它自己的分支
       const R=st._dtRect, inPanel=!!(R&&p.x>=R.x&&p.x<=R.x+R.w&&p.y>=R.y&&p.y<=R.y+R.h);
-      const h=hitHotFrom(p,st._dtHotStart);   // 2026-07-12 修点击穿透：只认详情弹窗自己的热区（下标≥_dtHotStart）·压在弹窗底下的词典标签/按钮一律无效（⚠扫场景私有 st.hot——build80 曾误扫恒空的引擎 HOT=按钮全失效+防护失效）
+      const h=hitHotFrom(p,st._dtHotStart);   // 只命中详情面板自身的按钮。
       if(h){ h.fn(); }
       else if(inPanel&&st._dtClip&&p.y>=st._dtClip.top&&p.y<=st._dtClip.bot&&(st.detailMax||0)>0){ st._dtDrag={y:p.y,s:st.detailScroll||0}; }   // 弹窗内滚动区空白=起拖
       else if(!inPanel){ st.detail=null; }   // 弹窗外=只关闭·绝不触发下层任何东西
@@ -1282,11 +1309,12 @@
     if(overFavList(p)){ st.favPan={sy:p.y,v:st.favScroll,moved:false}; return; }
     if(overFavPanel(p)){ return; }
     if(st.dictOpen&&st.dictT>0.9&&p.x>=st.panelX&&p.y>=st._dictGridTop){ st.dictPan={sy:p.y,v:st.dictScroll,moved:false}; return; }   // 词典网格区:按下=准备滚动/点卡(松手不动才算点)
-    if(inPlay(p)){   // 2026-07-17 换季拆除：漂浮采集物命中判定已摘（不再做工厂漂浮物类活动·用户拍板）
+    if(inPlay(p)){
       const c=hitCard(p); if(c){ const wp=screenToWorld(p.x,p.y); st.drag={card:c,ox:wp.x-c.x,oy:wp.y-c.y,homeX:c.tx,homeY:c.ty,downX:p.x,downY:p.y,moved:false}; st.cards.splice(st.cards.indexOf(c),1); st.cards.push(c); c.tscale=1.1; c.scale=1.1; sfxLift(); cv.setPointerCapture(e.pointerId);
         try{ clearTimeout(st._hoverHint); clearTimeout(st._pressHint); st._pressHint=setTimeout(function(){ if(st.drag&&st.drag.card===c&&!st.drag.moved){ showCardBubble(c,p); st.drag._hinted=true; } },1000); }catch(_){} }   // 彩蛋②：长按1秒(没拖动)→冒这张卡旁白
       else if(!st.canvasLocked) st.pan={sx:p.x,sy:p.y,vx:view.x,vy:view.y}; } });
-  legacyListen(cv,'pointermove',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||st.photoMode||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; if(OVERLAY) return; const p=toS(e); if(ptrs.has(e.pointerId)) ptrs.set(e.pointerId,p);   // OVERLAY 守卫：弹层开着时拖动归引擎 OVERLAY.move·防底下详情跟着滚（2026-07-12）
+  legacyListen(cv,'pointermove',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||st.photoMode||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; if(OVERLAY) return; const p=toS(e); if(ptrs.has(e.pointerId)) ptrs.set(e.pointerId,p);   // 覆盖层打开时，由覆盖层接收拖动。
+    if(gestureInProgress()){ noteActivity(); invalidate(); }
     if(st.favPick){const m=st.favPick;if(m.pan){const dy=m.pan.y-p.y;if(Math.abs(dy)>5)m.pan.moved=true;m.scroll=clamp(m.pan.scroll+dy,0,m.max||0);}return;}
     if(st._dtDrag){ st.detailScroll=clamp(st._dtDrag.s-(p.y-st._dtDrag.y),0,st.detailMax||0); return; }   // 详情滚动拖动中
     if(!st.drag&&!st.pan&&!st.dictPan&&!st.favPan&&!st.pinch&&e.pointerType!=='touch'){ try{ clearTimeout(st._hoverHint); st._hoverHint=setTimeout(function(){ if(controlsFree()&&!st.drag){ var cc=hitCard(p); if(cc) showCardBubble(cc,p); } },2000); }catch(_){} }   // 彩蛋②：鼠标悬停卡上不动2秒→旁白气泡(手机无hover·靠长按)
@@ -1298,29 +1326,38 @@
   legacyListen(cv,'pointerup',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; const p=toS(e); ptrs.delete(e.pointerId);
     if(st.favPick){const m=st.favPick,pan=m.pan;m.pan=null;if(pan&&!pan.moved&&!m.busy){const row=(m.rows||[]).find(r=>p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h);if(row)confirmCollectToFolder(m.card,row.index);}return;}
     if(st._dtDrag){ st._dtDrag=null; return; }   // 详情滚动拖动结束
-    if(st.pinch){ if(ptrs.size<2) st.pinch=null; return; }   // 捏合中松手=结束捏合·不触发点击/合成
+    if(st.pinch){ if(ptrs.size<2){ st.pinch=null; saveFactoryCanvas(); } return; }   // 捏合中松手=结束捏合·不触发点击/合成
     if(st.drag){ const c=st.drag.card, d=st.drag; st.drag=null; c.tscale=1; try{ clearTimeout(st._pressHint); }catch(_){}
-      if(!d.moved){ if(d._hinted){ c.tx=d.homeX; c.ty=d.homeY; return; } st.detail=c; sfxClick(); c.tx=d.homeX; c.ty=d.homeY; return; }   // 没拖动：长按已冒过旁白(_hinted)→只归位不弹详情；否则=点击→看详情
-      if(st.drawerOpen&&st._slotRects){ for(let i=0;i<4;i++){ const r=st._slotRects[i]; if(r&&!st.slots[i]&&p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h){ st.slots[i]={n:c.n,e:c.e}; c.tx=d.homeX; c.ty=d.homeY; sfxClick(); return; } } }
+      if(!d.moved){ c.tx=d.homeX; c.ty=d.homeY; saveFactoryCanvas(); if(!d._hinted){ st.detail=c; sfxClick(); } return; }   // 没拖动：长按已冒过旁白(_hinted)→只归位不弹详情；否则=点击→看详情
+      if(st.drawerOpen&&st._slotRects){ for(let i=0;i<4;i++){ const r=st._slotRects[i]; if(r&&!st.slots[i]&&p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h){ st.slots[i]={n:c.n,e:c.e}; c.tx=d.homeX; c.ty=d.homeY; saveFactoryCanvas(); sfxClick(); return; } } }
       if(overDict(p)){ backToDict(c,p,'已放回词典'); return; }
       if(outsideWorld(c)){ backToDict(c,p,'超出画布·已放回词典'); return; }
-      const t=overlap(c); if(t){ combineCards(c,t); return; } c.tx=c.x; c.ty=c.y; return; }
+      const t=overlap(c); if(t){ combineCards(c,t); return; } c.tx=c.x; c.ty=c.y; saveFactoryCanvas(); return; }
     if(st.favPan){ const d=st.favPan; st.favPan=null; if(!d.moved){ const c=(st._favCells||[]).find(r=>p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h); if(c&&spawnFromDict(c.d)) toast('已从收藏取出「'+c.d.n+'」'); } return; }   // 收藏抽屉:松手没滚动=取一张到画布；真正使用好友权限时由 spawnFromDict 显示免费提示
     if(st.dictPan){ const d=st.dictPan; st.dictPan=null; if(!d.moved){ const c=(st._dictCells||[]).find(r=>p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h); if(c) spawnFromDict(c.d); } return; }   // 词典:松手没滚动=点了某张卡→补到画布
     st.pan=null; });
-  legacyListen(cv,'pointercancel',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; if(e)ptrs.delete(e.pointerId); if(st.favPick)st.favPick.pan=null; if(ptrs.size<2) st.pinch=null; if(st.drag){ st.drag.card.tscale=1; st.drag=null; } st.pan=null; st.dictPan=null; st.favPan=null; st._dtDrag=null; });
-  legacyListen(cv,'wheel',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; if(st.photoMode){ e.preventDefault(); return; } if(OVERLAY) return; const p=toS(e);   // OVERLAY 守卫：弹层开着时滚轮归引擎 OVERLAY.wheel·防底下详情跟着滚（2026-07-12）
+  legacyListen(cv,'pointercancel',e=>{
+    if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return;
+    ptrs.delete(e.pointerId);
+    const finishingPinch=st.pinch&&ptrs.size<2;
+    if(finishingPinch||st.drag) saveFactoryCanvas();
+    if(finishingPinch) st.pinch=null;
+    if(st.drag){ st.drag.card.tscale=1; st.drag=null; }
+    if(st.favPick)st.favPick.pan=null;
+    st.pan=null; st.dictPan=null; st.favPan=null; st._dtDrag=null;
+  });
+  legacyListen(cv,'wheel',e=>{ if(CUR_NAME!=='工厂界面'||externalBlocked||(window.WXGC3_UI&&WXGC3_UI.isModalOpen&&WXGC3_UI.isModalOpen()))return; if(st.photoMode){ e.preventDefault(); return; } if(OVERLAY) return; const p=toS(e);   // 覆盖层打开时，由覆盖层接收滚轮。
     if(st.favPick){e.preventDefault();const m=st.favPick;if(!m.busy)m.scroll=clamp((m.scroll||0)+e.deltaY*.6,0,m.max||0);return;}
-    if(st.detail){ e.preventDefault(); st.detailScroll=clamp((st.detailScroll||0)+e.deltaY*0.6,0,st.detailMax||0); return; }   // 详情开着=滚轮滚详情内容（2026-07-12 滚动化）
+    if(st.detail){ e.preventDefault(); st.detailScroll=clamp((st.detailScroll||0)+e.deltaY*0.6,0,st.detailMax||0); return; }
     if(overFavList(p)){ e.preventDefault(); st.favScroll=clamp(st.favScroll+e.deltaY*0.6,0,st._favMaxScroll||0); return; }   // 滚轮在收藏抽屉里=滚收藏
     if(st.dictOpen&&st.dictT>0.9&&p.x>=st.panelX&&p.y>=st._dictGridTop){ e.preventDefault(); st.dictScroll=clamp(st.dictScroll+e.deltaY*0.6,0,st._dictMaxScroll||0); return; }   // 滚轮在词典网格区=滚词典
-    if(!inPlay(p))return; e.preventDefault(); if(st.canvasLocked) return; const ns=clamp(view.s*(e.deltaY<0?1.1:1/1.1),Z_MIN,Z_MAX),f=ns/view.s; view.x=p.x-(p.x-view.x)*f; view.y=(p.y-st.TICK_H)-((p.y-st.TICK_H)-view.y)*f; view.s=ns; },{passive:false});
-  legacyListen(window,'pagehide',()=>saveFactoryCanvas(true));
-  legacyListen(window,'beforeunload',()=>saveFactoryCanvas(true));
-  legacyListen(document,'visibilitychange',()=>{ if(document.visibilityState==='hidden') saveFactoryCanvas(true); });
+    if(!inPlay(p))return; e.preventDefault(); if(st.canvasLocked) return; const ns=clamp(view.s*(e.deltaY<0?1.1:1/1.1),Z_MIN,Z_MAX),f=ns/view.s; view.x=p.x-(p.x-view.x)*f; view.y=(p.y-st.TICK_H)-((p.y-st.TICK_H)-view.y)*f; view.s=ns; saveZoomSoon(); },{passive:false});
+  legacyListen(window,'pagehide',()=>saveFactoryCanvas());
+  legacyListen(window,'beforeunload',()=>saveFactoryCanvas());
+  legacyListen(document,'visibilitychange',()=>{ if(document.visibilityState==='hidden') saveFactoryCanvas(); });
   legacyListen(document,'keydown',e=>{ if(CUR_NAME!=='工厂界面'||!st.photoMode||e.key!=='Escape')return; e.preventDefault(); e.stopImmediatePropagation(); finishPhotoMode(photoHidden()?'key':'cancel'); try{sfxClick();}catch(_){}; },true);
 
-  /* ---------- 接真后端：登录后拉一次快照(账号 + 词典 + 我的卡牌)·铺本源·按本地集合标记拥有/首发 ---------- */
+  /* 读取本地存档中的卡牌和台面。 */
   // 按卡本身的首发状态打外观：别人首发的卡在词典里也保留金/蓝/彩边；我是否拥有只决定✓和透明度。
   // 单张卡打外观标（拥有✓/仅此一张金边/被打破蓝边/彩边/署名）——词典 DICT 与本地词库 LDICT 共用同一份逻辑
   function decorateCard(card){
@@ -1332,14 +1369,11 @@
   }
   async function bootData(){
     layout();setLocalSnapshot(WXGC3_UI.getState());
-    if(localHydrationNeeded){loadFactoryCanvas();localHydrationNeeded=false;}if(!st._seeded&&BASES.length){resetBaseView();seedBases(BASES);st._seeded=true;saveFactoryCanvas(true);}
+    if(localHydrationNeeded){loadFactoryCanvas();localHydrationNeeded=false;}if(!st._seeded&&BASES.length){resetBaseView();seedBases(BASES);st._seeded=true;saveFactoryCanvas();}
     if(STILL)loop();
   }
 
-  /* 2026-07-17 换季拆除：活动漂浮采集层（⑦·贝壳/萤火/采集/爆点/COL 整套）已整体摘除。
-     用户拍板：今后不再设计「工厂画布漂浮物点击收集」类活动·此坑位永久关闭。 */
-
-  /* ---------- 场景注册（重制版新增·原启动尾逻辑挪进 enter） ---------- */
+  /* 工厂场景入口。 */
   registerScene('工厂界面', {
     // 本页原样板参数：block阴影=引擎基准(47,58,74/.20)·toast 2000ms 顶部·热区裸注册(音效各处手动调)
     conf: { blockShadow:'rgba(47,58,74,.20)', toastDur:2000, toastY:function(){ return st.TICK_H+10; }, toastPad:28, toastAlpha:.96, hotSfx:false },
@@ -1349,7 +1383,7 @@
     leave: function(){
       if(st.photoMode) finishPhotoMode('leave',true);   // 切页时必恢复，不把“隐藏UI”状态带进别的页面
       clearGestures();              // 离工厂也清一次手势残留（与 enter 双保险·防幽灵手指）
-      saveFactoryCanvas(true);      // SPA 切页不触发 beforeunload——手动强存画布（清点风险#3 的修复）
+      saveFactoryCanvas();      // 从工厂返回主页时保存台面。
       st.menuOpen=false;
       try{ dq.blur(); fq.blur(); }catch(_){}
     },
@@ -1358,7 +1392,7 @@
       if(!data)return false;return spawnFromDict(localCardData(data,localState.save.cards.indexOf(data)));
     },
     onResize: function(){ layout(); },
-    draw: function(t){ drawFrame(); }
+    draw: drawFrame
   });
 
   const scene=SCENES['工厂界面'];
@@ -1369,7 +1403,7 @@
       tray:st._combineGeometry&&JSON.parse(JSON.stringify(st._combineGeometry)),
       slots:(st._slotRects||[]).map(rect=>rect&&Object.assign({},rect)),selected:st.slots.map(slot=>slot&&slot.n),
       pending:st.pending.map(item=>({id:item.operationId,x:item.x,y:item.y,screen:worldToScreen(item.x,item.y),cancel:item.cancel?{rect:Object.assign({},item.cancel)}:null})),
-      effects:st.effects.map(item=>({type:item.type,name:item.card&&item.card.n,ready:!!item.shareBtn})),
+      effects:st.effects.map(item=>({type:'big',name:item.card.n,ready:!!item.shareBtn})),
       hot:st.hot.map(rect=>({x:rect.x,y:rect.y,w:rect.w,h:rect.h})),drawerOpen:st.drawerOpen,dictOpen:st.dictOpen,
       favorites:{open:st.favOpen,tab:st.favTab,drawer:st._favDrawer,tabs:(st._favTabs||[]).map(r=>Object.assign({},r)),pages:st._favPages&&{previous:st._favPages.previous&&Object.assign({},st._favPages.previous),next:st._favPages.next&&Object.assign({},st._favPages.next)},cards:(st._favCells||[]).map(r=>({x:r.x,y:r.y,w:r.w,h:r.h,name:r.d.n}))},
       favoritePicker:st.favPick?{scroll:st.favPick.scroll||0,max:st.favPick.max||0,rect:st.favPick.rect,rows:(st.favPick.rows||[]).map(row=>Object.assign({},row))}:null,
@@ -1378,7 +1412,7 @@
   scene.setSnapshot=setLocalSnapshot;scene.inspect=inspectFactory;
   const factoryBinding={setSnapshot:setLocalSnapshot,addCardById:scene.addCard,inspect:inspectFactory,
     blockInput(value){externalBlocked=!!value;if(externalBlocked)clearGestures();},
-    destroy(){clearGestures();clearTimeout(st._hoverHint);clearTimeout(st._pressHint);
+    destroy(){clearGestures();clearTimeout(zoomSaveTimer);clearTimeout(st._hoverHint);clearTimeout(st._pressHint);
       [dq,fq].forEach(input=>{try{input.remove();}catch(_){}});
     }};
   scene.destroy=factoryBinding.destroy;

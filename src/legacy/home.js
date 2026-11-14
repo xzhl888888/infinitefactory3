@@ -1,16 +1,5 @@
 'use strict';
-/* =====================================================================
-   场景：主页（搬自 2代 v39《主页-拼装版.html》·视觉逐像素一致）
-   ---------------------------------------------------------------------
-   搬运改动清单（除此以外的绘制代码一字未动）：
-   1. 删掉了自带的画布/适配/配色/基元/音效/toast/指针——全部改用公共引擎（01-引擎.js）。
-   2. block 阴影色/toast 时长沿用本页原值（conf 参数），观感与2代一致。
-   3. location.href 整页跳转（7处）→ GO() 场景瞬切。
-   4. 数据获取 bootAcct() → 数据中心 DC：进页先用口袋现货立刻显示，后台悄悄对账。
-      （2代是每次进主页都硬等 /me + /firsts/now 两个请求）
-   5. 「背景飘落emoji」开关从"加载时读一次"改为"每次进页重读"——设置改完回来即生效。
-   6. 左下角版本号从写死的 'v0.1.0' 改为真实版本号（WXGC2_VERSION_LABEL）。
-   ===================================================================== */
+/* 主页沿用二代的版式与彩蛋，显示当前存档的发现数量。 */
 (function(){
   /* ---------- 数据/状态（场景私有） ---------- */
   var FALLEMOJI = true;   // 背景飘落emoji开关（enter 时重读设置）
@@ -19,35 +8,33 @@
   var FALL = ['☀️','🌊','🍉','❄️','🏊','🍦','🦗','🏖️','🐢','🧂','🏝️','🥤','💦','🎵'];
   var drops = FALL.map(function(e,i){ return { e:e, x:(i*0.137+0.05)%1, sp:8+(i%5)*3, ph:i*1.3, sz:18+(i%4)*4, a:.16+(i%3)*0.05 }; });
 
-  /* ==================== 彩蛋（纯前端·B造物工坊风·2026-07-02·不碰后端） ====================
-     ① 敲厂牌：连点主页大标题 →4 段对话→"掉"到屏幕底→玩家拖回原位→道谢；每敲一下冒一小把夏日 emoji。
-     ④ 金色工厂：背景飘落里偶尔混一个放大的金色🏭·点中→金光+一句。
-     ⑤ 夜猫子：深夜 0~4 点主页悄悄多一句问候。
-     全部只由主页 draw(t) 驱动·离页自然停·不吃后台。 */
+  /* 主页彩蛋包括可拖回的厂牌、可点的金色工厂和夜间问候。 */
+
   var _lastT=0, _dt=16;   // 帧间隔(ms)·给彩蛋物理/计时用（t 驱动·静帧也能推进）
   var EGG={ taps:0, state:'normal', tx:0, ty:0, tvy:0, trot:0, shake:0, drag:null, bubble:null, parts:[] };
   //   state: normal(可敲) | falling(掉落中) | fallen(躺底·可拖) | restoring(归位中)；tx/ty=厂牌相对原位偏移(设计px)
-  var GF={ x:0, y:0, sz:54, on:false, flash:0 };   // ④ 金色工厂当前状态
+  var GF={ x:0, y:0, flash:0 };
   var EGG_LINES=['你干嘛~','不要敲啦~','真的要掉啦~','再敲就要掉下来啦~，你也不想砸厂牌吧~~~','再敲就要掉下来啦~，你也不想砸厂牌吧~~~','啊！我的厂牌！'];   // 敲第 1~6 下的话（4/5 重复同一句警告·第 6 下才掉）
   var EGG_TB={ cx:0, y:0, w:0, h:0 };   // 厂牌当前包围盒(每帧更新·给点击/拖拽判定)
   var EGG_BURST=['☀️','🌊','🍉','🍦','💦','🎵','🏖️','🐢','🥤','❄️'];
 
-  function eggReset(){ EGG.taps=0; EGG.state='normal'; EGG.tx=0; EGG.ty=0; EGG.tvy=0; EGG.trot=0; EGG.shake=0; EGG.drag=null; EGG.bubble=null; EGG.parts.length=0; GF.on=false; GF.flash=0; try{ NOTE.open=false; NOTE.taps=0; }catch(_){} }
+  function eggReset(){ EGG.taps=0; EGG.state='normal'; EGG.tx=0; EGG.ty=0; EGG.tvy=0; EGG.trot=0; EGG.shake=0; EGG.drag=null; EGG.bubble=null; EGG.parts.length=0; GF.flash=0; try{ NOTE.open=false; NOTE.taps=0; }catch(_){} }
 
   function eggBurst(x,y){   // 冒一小把夏日 emoji：向上散开 + 微重力落下 + 淡出（位置按 t 解析·无需逐帧积分）
     var n=5+Math.floor(Math.random()*3);
     for(var i=0;i<n;i++){ var a=-Math.PI/2 + (Math.random()-0.5)*2.2, sp=0.05+Math.random()*0.07;
       EGG.parts.push({ e:EGG_BURST[Math.floor(Math.random()*EGG_BURST.length)], x0:x, y0:y,
-        vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, born:_lastT, life:850+Math.random()*450, sz:15+Math.random()*10 }); }
+        vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, born:STILL?_lastT:performance.now(), life:850+Math.random()*450, sz:15+Math.random()*10 }); }
   }
   function drawEggParts(t){ for(var i=EGG.parts.length-1;i>=0;i--){ var p=EGG.parts[i], age=t-p.born;
-      if(age>p.life){ EGG.parts.splice(i,1); continue; }
+      if(age>=p.life){ EGG.parts.splice(i,1); continue; }
+      if(age<0) continue;
       var x=p.x0+p.vx*age, y=p.y0+p.vy*age+0.00034*age*age, al=1-age/p.life;
       drawEmoji(p.e, x, y, p.sz, Math.max(0,al)); } }
 
   function eggBubble(txt,tapN){ var jx=(tapN>=2)?(Math.random()*110-55):(Math.random()*36-18), jy=(tapN>=2)?(Math.random()*18-9):0;
-    EGG.bubble={ txt:txt, x:EGG_TB.cx+jx, y:EGG_TB.y-46+jy, until:_lastT+1700 }; }
-  function drawEggBubble(){ if(!EGG.bubble) return; if(_lastT>EGG.bubble.until){ EGG.bubble=null; return; }
+    EGG.bubble={ txt:txt, x:EGG_TB.cx+jx, y:EGG_TB.y-46+jy, until:(STILL?_lastT:performance.now())+1700 }; }
+  function drawEggBubble(){ if(!EGG.bubble) return; if(_lastT>=EGG.bubble.until){ EGG.bubble=null; return; }
     var b=EGG.bubble; ctx.font=SB(13.5); var tw=ctx.measureText(b.txt).width, w=tw+26, h=33, x=clamp(b.x-w/2,8,W-w-8), y=b.y-h/2;
     block(x,y,w,h,13,PANEL,INK,2,3);
     ctx.beginPath(); ctx.moveTo(x+w/2-7,y+h-1); ctx.lineTo(x+w/2+7,y+h-1); ctx.lineTo(x+w/2,y+h+9); ctx.closePath(); ctx.fillStyle=PANEL; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
@@ -60,7 +47,7 @@
   function eggTitle(t){   // 画厂牌（含抖动/掉落/拖动/归位物理）+ normal 态注册可敲热区
     var cx=W/2, y0=H*0.16;
     if(EGG.state==='falling'){ EGG.tvy+=0.00095*_dt; EGG.ty+=EGG.tvy*_dt; EGG.trot+=0.0011*_dt;
-      var floorY=H*0.57-y0; if(EGG.ty>=floorY){ EGG.ty=floorY; EGG.tvy*=-0.3; if(Math.abs(EGG.tvy)<0.05){ EGG.tvy=0; EGG.state='fallen'; } } }   // 落点=红线(底部按钮顶部)·厂牌坐按钮上方·不再压住按钮误触
+      var floorY=H*0.57-y0; if(EGG.ty>=floorY){ EGG.ty=floorY; EGG.tvy*=-0.3; if(Math.abs(EGG.tvy)<0.05){ EGG.tvy=0; EGG.state='fallen'; } } }   // 厂牌落在按钮上方，按钮仍然可以正常点击。
     else if(EGG.state==='restoring'){ var k=Math.min(1,0.009*_dt); EGG.tx+=(0-EGG.tx)*k; EGG.ty+=(0-EGG.ty)*k; EGG.trot+=(0-EGG.trot)*k;
       if(Math.abs(EGG.tx)<1.2&&Math.abs(EGG.ty)<1.2&&Math.abs(EGG.trot)<0.02){ EGG.tx=0; EGG.ty=0; EGG.trot=0; EGG.state='normal'; } }
     var shake=0; if(EGG.shake>0){ EGG.shake-=_dt; shake=Math.sin(t*0.045)*Math.min(6,EGG.shake*0.032); }
@@ -72,33 +59,79 @@
     if(EGG.state==='normal') pushHot(tx-EGG_TB.w/2, ty-EGG_TB.h/2, EGG_TB.w, EGG_TB.h, eggTapTitle);
   }
 
-  function eggGold(t){   // ④ 金色工厂：偶尔从顶飘到底（右侧车道·避开中央 UI）·点中→金光+一句
-    var period=34000, win=8500, ph=t%period;
-    if(ph<win){ var pr=ph/win; GF.on=true; GF.x=W*0.83+Math.sin(t*0.0006)*18; GF.y=-34+(H+68)*pr; GF.sz=54;
-      ctx.save(); ctx.shadowColor='rgba(199,154,62,.75)'; ctx.shadowBlur=16; drawEmoji('🏭',GF.x,GF.y,GF.sz); ctx.restore();
-      pushHot(GF.x-GF.sz/2, GF.y-GF.sz/2, GF.sz, GF.sz, eggTapGold);
-    } else GF.on=false;
-    if(GF.flash>0){ GF.flash-=_dt; var fa=GF.flash/600, r=30+(1-fa)*42; ctx.save(); ctx.globalAlpha=Math.max(0,fa);
-      var rg=ctx.createRadialGradient(GF.x,GF.y,2,GF.x,GF.y,r); rg.addColorStop(0,'rgba(255,225,150,.9)'); rg.addColorStop(1,'rgba(255,225,150,0)'); ctx.fillStyle=rg; ctx.beginPath(); ctx.arc(GF.x,GF.y,r,0,7); ctx.fill(); ctx.restore(); } }
-  function eggTapGold(){ if(!GF.on) return; GF.flash=600; eggBurst(GF.x,GF.y); GF.on=false; toast('🏭 你发现了藏起来的金色工厂！'); }
+  function drawGoldFlash(){   // 金色工厂的落点由点击时的动画坐标决定
+    if(GF.flash<=0) return;
+    GF.flash=Math.max(0,GF.flash-_dt);
+    var fa=GF.flash/600, r=30+(1-fa)*42;
+    ctx.save(); ctx.globalAlpha=fa;
+    var rg=ctx.createRadialGradient(GF.x,GF.y,2,GF.x,GF.y,r); rg.addColorStop(0,'rgba(255,225,150,.9)'); rg.addColorStop(1,'rgba(255,225,150,0)');
+    ctx.fillStyle=rg; ctx.beginPath(); ctx.arc(GF.x,GF.y,r,0,7); ctx.fill(); ctx.restore();
+  }
 
-  function eggNight(){   // ⑤ 深夜 0~4 点悄悄一句（?shot&night=1 可强制显示供自检）
-    var hr; try{ hr=(STILL&&/[?&]night=1/.test(location.search))?1:new Date().getHours(); }catch(_){ hr=null; }
-    if(hr!=null && hr>=0 && hr<4){ ctx.font=SB(W<440?9:12); ctx.fillStyle=MUTE; ctx.textAlign=W<440?'right':'center'; ctx.textBaseline='alphabetic'; ctx.fillText('🌙 这么晚还在造物呀~', W<440?W-12:W/2, H-15); } }
+  function eggNight(){   // ⑤ 只在问候文字需要切换时唤醒
+    var date=new Date(), hr=(STILL&&/[?&]night=1/.test(location.search))?1:date.getHours();
+    if(hr<4){ ctx.font=SB(W<440?9:12); ctx.fillStyle=MUTE; ctx.textAlign=W<440?'right':'center'; ctx.textBaseline='alphabetic'; ctx.fillText('🌙 这么晚还在造物呀~', W<440?W-12:W/2, H-15); }
+    return (hr<4?date.setHours(4,0,0,0):date.setHours(24,0,0,0))-Date.now();
+  }
 
-  /* ---------- 背景:暖纸工作台 + 蓝图点阵 + 射灯 + 飘落 emoji ---------- */
-  /* 【性能·2026-07-03 审计头号热点】静态三层(渐变+点阵+射灯)原来每帧重建 2 个全屏渐变+3 次全屏填充——
-     现烘进引擎 cachedLayer 离屏(只在首次/resize 重画)·每帧只 drawImage 一次·像素与原来逐点一致。 */
-  function drawBg(t){
-    cachedLayer('bg:主页', function(){
-      var g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#f6f1e8'); g.addColorStop(1,'#e9e1d3'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
-      drawDots('rgba(60,80,95,.06)');   // 【M5】点阵走引擎离屏缓存·像素与原双重循环逐点一致
-      var lg=ctx.createRadialGradient(W/2,H*0.42,10,W/2,H*0.42,W*0.5); lg.addColorStop(0,'rgba(255,252,240,.75)'); lg.addColorStop(1,'rgba(255,252,240,0)'); ctx.fillStyle=lg; ctx.fillRect(0,0,W,H);   // 中央造物射灯
+  var decor=null;
+  function createDecor(){
+    // 顺序沿用二代：纸面、飘落图案、可交互的主页，再叠加主按钮扫光。
+    var backdrop=document.createElement('div'), fallLayer=document.createElement('div'), gold=document.createElement('span'), sweep=document.createElement('div');
+    backdrop.className='wx-legacy-home-backdrop';
+    fallLayer.className='wx-legacy-home-falls';
+    backdrop.setAttribute('aria-hidden','true');
+    sweep.className='wx-legacy-home-sweep';
+    sweep.setAttribute('aria-hidden','true');
+    drops.forEach(function(drop){
+      var span=document.createElement('span'), loop=(540+60)*1000/(drop.sp*16);
+      span.className='wx-legacy-home-fall';
+      span.textContent=drop.e;
+      span.style.left=(drop.x*100)+'%';
+      span.style.opacity=drop.a;
+      span.style.setProperty('--drop-size',drop.sz+'px');
+      span.style.animationDuration=loop+'ms';
+      span.style.animationDelay=-(drop.ph*120%(540+60))*1000/(drop.sp*16)+'ms';
+      fallLayer.append(span);
     });
-    // 顶部缓慢飘落的夏日 emoji（设置可关·关了更省电）
-    if(FALLEMOJI) drops.forEach(function(d){ var span=H+60, yy=((t*0.001*d.sp*16 + d.ph*120)%span) - 40, xx=d.x*W + Math.sin(t*0.0004+d.ph)*16;
-      drawEmoji(d.e, xx, yy, d.sz, d.a); });
-    if(FALLEMOJI) eggGold(t);   // ④ 彩蛋：飘落里偶尔混一个放大的金色工厂🏭
+    gold.className='wx-legacy-home-gold';
+    gold.textContent='🏭';
+    fallLayer.append(gold);
+    backdrop.append(fallLayer);
+    cv.before(backdrop);
+    cv.after(sweep);
+    return {backdrop:backdrop,fallLayer:fallLayer,gold:gold,sweep:sweep};
+  }
+  function homeButtonWidth(){ return Math.min(170,(W-24-(W<580?8:16)*2)/3); }
+  function drawBackdrop(){
+    var layer=cachedLayer('bg:主页',function(){
+      var g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#f6f1e8'); g.addColorStop(1,'#e9e1d3'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+      drawDots('rgba(60,80,95,.06)');
+      var lg=ctx.createRadialGradient(W/2,H*0.42,10,W/2,H*0.42,W*0.5); lg.addColorStop(0,'rgba(255,252,240,.75)'); lg.addColorStop(1,'rgba(255,252,240,0)'); ctx.fillStyle=lg; ctx.fillRect(0,0,W,H);
+    });
+    if(STILL){
+      ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.drawImage(layer,0,0); ctx.restore();
+      return;
+    }
+    var scale=cvRect().height/H, box=decor.backdrop.style, sweep=decor.sweep.style;
+    if(layer.parentElement!==decor.backdrop){
+      if(decor.backdrop.firstChild!==decor.fallLayer) decor.backdrop.firstChild.remove();
+      decor.backdrop.prepend(layer);
+    }
+    box.setProperty('--ui-scale',scale);
+    box.setProperty('--fall-travel',(H+60)*scale+'px');
+    box.setProperty('--gold-travel',(H+68)*scale+'px');
+    sweep.width=homeButtonWidth()*scale+'px';
+    sweep.height=52*scale+'px';
+    sweep.borderRadius=14*scale+'px';
+  }
+  function tapGold(p,e){
+    if(!decor||decor.fallLayer.hidden||p.x<W*.83-55||p.x>W*.83+55) return;
+    var r=decor.gold.getBoundingClientRect();
+    if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom) return;
+    var center=toS({clientX:r.left+r.width/2,clientY:r.top+r.height/2});
+    GF.x=center.x; GF.y=center.y; GF.flash=600; eggBurst(GF.x,GF.y); sfxClick();
+    toast('🏭 你发现了藏起来的金色工厂！');
   }
 
   /* ---------- 顶部小药丸（登录信息 / 金币 / 设置·读真账号·游客态）（原样，仅跳转改 GO） ---------- */
@@ -123,10 +156,11 @@
     ctx.font=SB(14); ctx.fillStyle=MUTE; var firstLabel='已发现卡牌', firstW=ctx.measureText(firstLabel).width, firstX=cx-(firstW+20)/2; drawEmoji('✨',firstX+8,H*0.27,14); ctx.fillText(firstLabel,firstX+20+firstW/2,H*0.27);
     // 大数字 count-up：进页从 0 缓动到全球首发总数（营造氛围·outCubic 先快后慢落定·1.4s）。
     //   只由主页 draw(t) 驱动，离页后 draw 不再被引擎调 → 动画自然停、不吃后台资源。
-    var pulse=1+Math.sin(t*0.002)*0.012, num;
+    var pulse=1, num;
     if(FIRSTS==null){ num='—'; _numStart=null; }   // 数据没到→显—·等到位后从0起跳
     else { if(_numStart==null){ _numStart=t; _numTarget=FIRSTS; }   // FIRSTS 到位那刻起跳
-      var _p=clamp((t-_numStart)/1400,0,1), _cur=(_p>=1)?FIRSTS:Math.round(_numTarget*ease.outCubic(_p));   // 落定后显实时值(后台对账更新也跟上·不重跳)
+      var _p=FXSET.fx?clamp((t-_numStart)/1400,0,1):1, _cur=(_p>=1)?FIRSTS:Math.round(_numTarget*ease.outCubic(_p));
+      pulse=1+Math.sin(_p*2*Math.PI)*(1-_p)*0.012;
       num=_cur.toLocaleString('en-US'); }
     ctx.save(); ctx.translate(cx,H*0.47); ctx.scale(pulse,pulse);
     ctx.font=B(124);var numberWidth=ctx.measureText(num).width;ctx.font=B(Math.min(124,124*(W-30)/Math.max(1,numberWidth))); ctx.textAlign='center'; ctx.textBaseline='middle';
@@ -134,16 +168,12 @@
     ctx.lineWidth=3; ctx.strokeStyle=INK; ctx.strokeText(num,0,0);   // 墨描边(1代式大数字·B 配色·放大)
     ctx.restore();
     // 三大入口
-    var by=H*0.64,gap=W<580?8:16,bw=Math.min(170,(W-24-gap*2)/3),bh=52,narrow=W<440,labelSize=narrow?12:17,iconSpace=narrow?18:28;
-    var labels=[['📁','存档',PANEL,false],['🏭','进入工厂',GOLD,true],['🧩','Mod',PANEL,false]];   // 主入口"进入工厂"放中间·金色突出
+    var by=H*0.64,gap=W<580?8:16,bw=homeButtonWidth(),bh=52,narrow=W<440,labelSize=narrow?12:17,iconSpace=narrow?18:28;
+    var labels=[['📁','存档',PANEL],['🏭','进入工厂',GOLD],['🧩','Mod',PANEL]];   // 主入口"进入工厂"放中间·金色突出
     var totW=bw*3+gap*2, sx0=cx-totW/2;
     labels.forEach(function(L,i){ var bx=sx0+i*(bw+gap); block(bx,by,bw,bh,14,L[2],INK,2.6);
       ctx.font=B(labelSize); var tlw=ctx.measureText(L[1]).width, grpW=iconSpace+tlw, gx0=bx+bw/2-grpW/2;
       ctx.textAlign='left'; ctx.textBaseline='middle'; drawEmoji(L[0],gx0+(narrow?6:9),by+bh/2,narrow?14:19); ctx.font=B(labelSize); ctx.fillStyle=INK; ctx.fillText(L[1],gx0+iconSpace,by+bh/2+.5);
-      if(L[3]){ var shp=(t%3200)/3200; if(shp<0.28){ var p2=shp/0.28; ctx.save(); rr(bx,by,bw,bh,14); ctx.clip();   // E：主按钮微光·每3.2秒一道斜光扫过(只在扫过的0.9秒内画·其余帧零开销)
-        var sx2=bx-50+(bw+100)*p2, g2=ctx.createLinearGradient(sx2-26,by,sx2+26,by+bh);
-        g2.addColorStop(0,'rgba(255,255,255,0)'); g2.addColorStop(0.5,'rgba(255,255,255,.45)'); g2.addColorStop(1,'rgba(255,255,255,0)');
-        ctx.fillStyle=g2; ctx.fillRect(bx,by,bw,bh); ctx.restore(); } }
       pushHot(bx,by,bw,bh,function(){ if(L[1]==='进入工厂'){ if(WXGC3_UI.ensurePlay()) GO('工厂界面'); } else WXGC3_UI.open(L[1]==='存档'?'saves':'mods'); }); });
     // 原赛季区域留作本地进度条，同一块暖纸和原来的次入口尺寸。
     var state=WXGC3_UI.getState(), save=state&&state.save;
@@ -193,12 +223,34 @@
       FALLEMOJI = !!(window.WXGC2_API && WXGC2_API.settings) ? (WXGC2_API.settings.get('fallEmoji')!==false) : true;   // 每次进页重读设置
       syncState(WXGC3_UI.getState());
       _numStart=null;   // 每次进主页：大数字从 0 重新跳动到当前值（离页后 draw 停·不吃后台资源）
-      eggReset();       // 彩蛋状态每次进主页重置（厂牌回原位·清气泡/粒子）
+      eggReset();
+      if(!STILL){
+        if(!decor) decor=createDecor();
+        decor.backdrop.hidden=false; decor.gold.style.animationDelay=-(performance.now()%34000)+'ms';
+        drawBackdrop();
+      }
     },
-    draw: function(t){ _dt=Math.max(1,Math.min(50,(t-_lastT)||16)); _lastT=t; drawBg(t); topBar(); center(t); corners(); eggNight(); drawEggBubble(); drawEggParts(t); drawNote(t); },
+    onResize:function(){ if(decor) drawBackdrop(); },
+    leave:function(){ if(decor){ decor.backdrop.hidden=true; decor.sweep.hidden=true; } },
+    destroy:function(){ if(decor){ decor.backdrop.remove(); decor.sweep.remove(); decor=null; } },
+    draw:function(t){
+      _dt=Math.max(1,Math.min(50,(t-_lastT)||16)); _lastT=t;
+      if(STILL) drawBackdrop();
+      else {
+        decor.fallLayer.hidden=!FALLEMOJI;
+        decor.sweep.hidden=!FXSET.fx||NOTE.open;
+        decor.backdrop.classList.toggle('wx-legacy-paused',NOTE.open);
+      }
+      topBar(); center(t); corners(); var next=eggNight();
+      drawGoldFlash(); drawEggBubble(); drawEggParts(t); drawNote(t);
+      if((FXSET.fx&&t-_numStart<1400)||EGG.shake>0||EGG.parts.length||GF.flash>0||
+         EGG.state==='falling'||EGG.state==='restoring'||(NOTE.open&&t-NOTE.t0<380)) return 0;
+      return EGG.bubble?Math.min(next,EGG.bubble.until-t):next;
+    },
+    emptyTap:tapGold,
     // 彩蛋①：厂牌掉落后可拖回——只在 fallen 态命中厂牌才消费事件(返回 true)；其余返回 false，让引擎照常走热区/按钮
     pointerdown: function(p){ if(EGG.state==='fallen'){ if(p.x>=EGG_TB.cx-EGG_TB.w/2&&p.x<=EGG_TB.cx+EGG_TB.w/2&&p.y>=EGG_TB.y-EGG_TB.h/2&&p.y<=EGG_TB.y+EGG_TB.h/2){ EGG.drag={dx:p.x-(W/2+EGG.tx), dy:p.y-(H*0.16+EGG.ty)}; return true; } } return false; },
-    pointermove: function(p){ if(EGG.drag){ EGG.tx=p.x-W/2-EGG.drag.dx; EGG.ty=p.y-H*0.16-EGG.drag.dy; } },
+    pointermove: function(p){ if(EGG.drag){ EGG.tx=p.x-W/2-EGG.drag.dx; EGG.ty=p.y-H*0.16-EGG.drag.dy; noteActivity(); invalidate(); } },
     pointercancel:function(){ EGG.drag=null; },
     pointerup: function(p){ if(EGG.drag){ EGG.drag=null; if(Math.abs(EGG.tx)<72&&Math.abs(EGG.ty)<58){ EGG.state='restoring'; EGG.taps=0; eggBubble('谢谢你~祝您游戏愉快~',1); } else EGG.state='fallen'; } }
   });
